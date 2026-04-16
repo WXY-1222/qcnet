@@ -104,6 +104,45 @@ class InteractionDIGIRDataset(Dataset):
         if num_agents <= 0:
             raise ValueError('Sample has no valid agents')
 
+        hist_valid_np = np.isfinite(traj_np[:num_agents, :self.num_historical_steps, :2]).all(axis=-1)
+        future_valid_np = np.isfinite(fut_np[:num_agents, :self.num_future_steps, :2]).all(axis=-1)
+
+        full_valid_mask = self._extract_mask(
+            sample=sample,
+            keys=['valid_mask', 'agent_valid_mask'],
+            num_agents=num_agents,
+            num_steps=self.num_steps)
+        if full_valid_mask is not None:
+            hist_valid_np &= full_valid_mask[:, :self.num_historical_steps]
+            future_valid_np &= full_valid_mask[:, self.num_historical_steps:]
+
+        full_predict_mask = self._extract_mask(
+            sample=sample,
+            keys=['predict_mask', 'agent_predict_mask'],
+            num_agents=num_agents,
+            num_steps=self.num_steps)
+        if full_predict_mask is not None:
+            future_valid_np &= full_predict_mask[:, self.num_historical_steps:]
+
+        hist_mask = self._extract_mask(
+            sample=sample,
+            keys=['history_mask', 'historical_mask', 'hist_mask', 'trajectory_mask', 'traj_mask', 'obs_mask'],
+            num_agents=num_agents,
+            num_steps=self.num_historical_steps)
+        if hist_mask is not None:
+            hist_valid_np &= hist_mask
+
+        future_mask = self._extract_mask(
+            sample=sample,
+            keys=['future_mask', 'prediction_mask', 'pred_mask', 'target_mask', 'fut_mask'],
+            num_agents=num_agents,
+            num_steps=self.num_future_steps)
+        if future_mask is not None:
+            future_valid_np &= future_mask
+
+        traj_np = np.nan_to_num(traj_np, nan=0.0, posinf=0.0, neginf=0.0)
+        fut_np = np.nan_to_num(fut_np, nan=0.0, posinf=0.0, neginf=0.0)
+
         traj = torch.from_numpy(traj_np[:num_agents, :self.num_historical_steps]).float()
         future_xy = torch.from_numpy(fut_np[:num_agents, :self.num_future_steps, :2]).float()
 
@@ -116,9 +155,11 @@ class InteractionDIGIRDataset(Dataset):
         velocity_future = self._build_future_velocity(traj[..., :2], future_xy)
         velocity = torch.cat([velocity_hist, velocity_future], dim=1)
 
-        valid_mask = torch.ones(num_agents, self.num_steps, dtype=torch.bool)
+        valid_mask = torch.zeros(num_agents, self.num_steps, dtype=torch.bool)
+        valid_mask[:, :self.num_historical_steps] = torch.from_numpy(hist_valid_np).bool()
+        valid_mask[:, self.num_historical_steps:] = torch.from_numpy(future_valid_np).bool()
         predict_mask = torch.zeros(num_agents, self.num_steps, dtype=torch.bool)
-        predict_mask[:, self.num_historical_steps:] = True
+        predict_mask[:, self.num_historical_steps:] = torch.from_numpy(future_valid_np).bool()
 
         agent_type = self._build_agent_type(sample, num_agents)
         agent_category = torch.full((num_agents,), 3, dtype=torch.uint8)
@@ -234,9 +275,14 @@ class InteractionDIGIRDataset(Dataset):
             edge_types_np = np.zeros((0,), dtype=np.int64)
         else:
             positions = np.asarray(kg.get('positions', np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
-            facility_types = np.asarray(kg.get('facility_types', np.zeros((0,), dtype=np.int64)), dtype=np.int64)
-            edge_index_np = np.asarray(kg.get('edge_index', np.zeros((2, 0), dtype=np.int64)), dtype=np.int64)
-            edge_types_np = np.asarray(kg.get('edge_types', np.zeros((0,), dtype=np.int64)), dtype=np.int64)
+            facility_types = np.asarray(kg.get('facility_types', np.zeros((0,), dtype=np.int64)))
+            edge_index_np = np.asarray(kg.get('edge_index', np.zeros((2, 0), dtype=np.int64)))
+            edge_types_np = np.asarray(kg.get('edge_types', np.zeros((0,), dtype=np.int64)))
+
+            positions = np.nan_to_num(positions, nan=0.0, posinf=0.0, neginf=0.0)
+            facility_types = np.nan_to_num(facility_types, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
+            edge_index_np = np.nan_to_num(edge_index_np, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
+            edge_types_np = np.nan_to_num(edge_types_np, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
 
             if positions.ndim != 2 or positions.shape[1] < 2:
                 positions = np.zeros((0, 2), dtype=np.float32)
@@ -307,6 +353,33 @@ class InteractionDIGIRDataset(Dataset):
             'edge_index': edge_index,
             'edge_type': edge_type,
         }
+
+    @staticmethod
+    def _extract_mask(
+            sample: Dict[str, Any],
+            keys: List[str],
+            num_agents: int,
+            num_steps: int) -> Optional[np.ndarray]:
+        for key in keys:
+            if key not in sample:
+                continue
+            mask_raw = np.asarray(sample[key])
+            if mask_raw.ndim == 1:
+                if mask_raw.size == num_agents * num_steps:
+                    mask_raw = mask_raw.reshape(num_agents, num_steps)
+                else:
+                    continue
+            if mask_raw.ndim < 2:
+                continue
+            mask_raw = mask_raw[:num_agents, :num_steps]
+            mask_bool = np.zeros((num_agents, num_steps), dtype=bool)
+            rows = min(num_agents, mask_raw.shape[0])
+            cols = min(num_steps, mask_raw.shape[1])
+            if rows > 0 and cols > 0:
+                mask_bool[:rows, :cols] = np.nan_to_num(
+                    mask_raw[:rows, :cols], nan=0.0, posinf=0.0, neginf=0.0) > 0.5
+            return mask_bool
+        return None
 
     @staticmethod
     def _build_map_orientation(positions: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
