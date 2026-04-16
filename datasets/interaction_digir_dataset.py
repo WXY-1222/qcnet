@@ -126,7 +126,8 @@ class InteractionDIGIRDataset(Dataset):
         agent_ids = [f"agent_{i}" for i in range(num_agents)]
 
         map_features = self._build_map_features(sample)
-        num_map_nodes = map_features['map_polygon']['num_nodes']
+        map_polygon = map_features['map_polygon']
+        num_map_nodes = int(map_polygon.get('num_nodes', map_polygon['position'].size(0)))
         point_to_polygon_edge_index = torch.stack(
             [torch.arange(num_map_nodes, dtype=torch.long),
              torch.arange(num_map_nodes, dtype=torch.long)],
@@ -297,6 +298,7 @@ class InteractionDIGIRDataset(Dataset):
                 'side': point_side,
             },
             'map_polygon': {
+                'num_nodes': num_nodes,
                 'position': map_pos,
                 'orientation': map_orientation,
                 'type': polygon_type,
