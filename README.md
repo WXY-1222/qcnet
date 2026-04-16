@@ -113,9 +113,12 @@ For INTERACTION runs, use:
 Validation metrics are still QCNet's `val_minADE`, `val_minFDE`, and `val_MR`, which are the kinematic core metrics for DIGIR-style comparison.
 Set `--eval_k 5` during training if you want strict DIGIR `k=5` alignment (then these three metrics are computed at K=5).
 Set `--monitor_metric val_minADE` if you want checkpoint selection aligned to ADE-first reporting.
+Set `--check_val_every_n_epoch` to align evaluation frequency with your DIGIR runs.
 
 By default, INTERACTION test split is strict: missing `test` in the pickle raises an error.
 If you explicitly want to reuse `val` as `test`, pass `--allow_test_as_val`.
+If you need location-level filtering parity, use `--locations loc1,loc2,...` in train/val/test.
+Each run also writes `run_meta_*.json` under `--save_root` for reproducibility (args + git commit).
 
 DIGIR-aligned one-command training script:
 ```bash

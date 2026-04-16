@@ -34,7 +34,8 @@ class InteractionDIGIRDataset(Dataset):
             num_future_steps: int = 12,
             max_samples: Optional[int] = None,
             use_kg: bool = True,
-            allow_test_as_val: bool = False) -> None:
+            allow_test_as_val: bool = False,
+            locations: Optional[List[str]] = None) -> None:
         super(InteractionDIGIRDataset, self).__init__()
         self.data_path = os.path.expanduser(os.path.normpath(data_path))
         self.split = split
@@ -44,6 +45,7 @@ class InteractionDIGIRDataset(Dataset):
         self.num_steps = num_historical_steps + num_future_steps
         self.max_samples = max_samples
         self.use_kg = use_kg
+        self.locations = [str(loc) for loc in locations] if locations is not None else None
 
         with open(self.data_path, 'rb') as f:
             payload = pickle.load(f)
@@ -60,6 +62,10 @@ class InteractionDIGIRDataset(Dataset):
         split_samples = payload.get(split_key, [])
         if not isinstance(split_samples, list):
             raise TypeError(f"Split '{split_key}' in {self.data_path} must be a list")
+
+        if self.locations is not None:
+            location_set = set(self.locations)
+            split_samples = [s for s in split_samples if str(s.get('location_name', '')) in location_set]
         if max_samples is not None and max_samples > 0:
             split_samples = split_samples[:max_samples]
         self.samples: List[Dict[str, Any]] = split_samples

@@ -13,6 +13,10 @@
 # limitations under the License.
 from argparse import ArgumentParser
 from argparse import ArgumentTypeError
+from datetime import datetime
+import json
+import os
+import subprocess
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor
@@ -54,17 +58,21 @@ if __name__ == '__main__':
     parser.add_argument('--val_processed_dir', type=str, default=None)
     parser.add_argument('--test_processed_dir', type=str, default=None)
     parser.add_argument('--interaction_data_path', type=str, default=None)
+    parser.add_argument('--locations', type=str, default=None,
+                        help='Comma-separated location names for filtering interaction samples')
     parser.add_argument('--train_max_samples', type=int, default=None)
     parser.add_argument('--val_max_samples', type=int, default=None)
     parser.add_argument('--test_max_samples', type=int, default=None)
     parser.add_argument('--use_kg', type=_str2bool, default=True)
     parser.add_argument('--batch_by_location', action='store_true')
     parser.add_argument('--location_batch_seed', type=int, default=None)
+    parser.add_argument('--ddp_even_strategy', type=str, default='drop', choices=['drop', 'pad'])
     parser.add_argument('--allow_test_as_val', action='store_true')
     parser.add_argument('--require_test_split', action='store_true')
     parser.add_argument('--accelerator', type=str, default='auto')
     parser.add_argument('--devices', type=int, required=True)
     parser.add_argument('--max_epochs', type=int, default=64)
+    parser.add_argument('--check_val_every_n_epoch', type=int, default=1)
     parser.add_argument('--eval_batches', type=int, default=0,
                         help='0 for full validation; >0 limits number of val batches per epoch')
     parser.add_argument('--monitor_metric', type=str, default='val_minADE')
@@ -83,6 +91,27 @@ if __name__ == '__main__':
         'argoverse_v2': ArgoverseV2DataModule,
         'interaction_digir': InteractionDIGIRDataModule,
     }[args.dataset](**vars(args))
+
+    if args.save_root is not None:
+        os.makedirs(args.save_root, exist_ok=True)
+        git_commit = ''
+        try:
+            git_commit = subprocess.check_output(
+                ['git', 'rev-parse', 'HEAD'],
+                stderr=subprocess.DEVNULL,
+                text=True).strip()
+        except Exception:
+            git_commit = ''
+        run_meta = {
+            'timestamp': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'git_commit': git_commit,
+            'argv': vars(args),
+        }
+        meta_file = os.path.join(args.save_root, f'run_meta_{datetime.utcnow().strftime("%Y%m%d_%H%M%S")}.json')
+        with open(meta_file, 'w', encoding='utf-8') as f:
+            json.dump(run_meta, f, ensure_ascii=False, indent=2)
+        print(f'[RunMeta] saved to {meta_file}')
+
     model_checkpoint = ModelCheckpoint(monitor=args.monitor_metric, save_top_k=5, mode=args.monitor_mode)
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
     trainer_kwargs = dict(
@@ -91,6 +120,7 @@ if __name__ == '__main__':
         strategy=DDPStrategy(find_unused_parameters=False, gradient_as_bucket_view=True),
         callbacks=[model_checkpoint, lr_monitor],
         max_epochs=args.max_epochs,
+        check_val_every_n_epoch=args.check_val_every_n_epoch,
     )
     if args.save_root is not None:
         trainer_kwargs['default_root_dir'] = args.save_root

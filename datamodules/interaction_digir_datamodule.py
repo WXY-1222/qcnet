@@ -5,7 +5,7 @@
 import math
 import random
 from collections import defaultdict
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pytorch_lightning as pl
 import torch.distributed as dist
@@ -18,10 +18,17 @@ from transforms import TargetBuilder
 
 class _LocationBatchSampler(Sampler[List[int]]):
 
-    def __init__(self, locations: List[str], batch_size: int, shuffle: bool, seed: int = 0) -> None:
+    def __init__(
+            self,
+            locations: List[str],
+            batch_size: int,
+            shuffle: bool,
+            seed: int = 0,
+            ddp_even_strategy: str = 'drop') -> None:
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.seed = seed
+        self.ddp_even_strategy = ddp_even_strategy
         self._iter_calls = 0
         loc_to_indices: Dict[str, List[int]] = defaultdict(list)
         for idx, loc in enumerate(locations):
@@ -29,7 +36,7 @@ class _LocationBatchSampler(Sampler[List[int]]):
         self.loc_to_indices = dict(loc_to_indices)
 
     @staticmethod
-    def _get_dist_env() -> (int, int):
+    def _get_dist_env() -> Tuple[int, int]:
         if dist.is_available() and dist.is_initialized():
             return dist.get_rank(), dist.get_world_size()
         return 0, 1
@@ -54,9 +61,31 @@ class _LocationBatchSampler(Sampler[List[int]]):
             rng.shuffle(all_batches)
         return all_batches
 
+    def _make_even_global(self, all_batches: List[List[int]], world_size: int) -> List[List[int]]:
+        if world_size <= 1:
+            return all_batches
+        num_batches = len(all_batches)
+        if num_batches == 0:
+            return all_batches
+        remainder = num_batches % world_size
+        if remainder == 0:
+            return all_batches
+
+        if self.ddp_even_strategy == 'pad':
+            needed = world_size - remainder
+            reps = (needed + num_batches - 1) // num_batches
+            return all_batches + (all_batches * reps)[:needed]
+
+        # default: drop tail. If too few batches, fallback to pad to avoid empty ranks.
+        if num_batches < world_size:
+            needed = world_size - num_batches
+            reps = (needed + num_batches - 1) // num_batches
+            return all_batches + (all_batches * reps)[:needed]
+        return all_batches[: num_batches - remainder]
+
     def __iter__(self):
         rank, world_size = self._get_dist_env()
-        all_batches = self._build_all_batches()
+        all_batches = self._make_even_global(self._build_all_batches(), world_size)
         rank_batches = all_batches[rank::world_size]
         for batch in rank_batches:
             yield batch
@@ -67,9 +96,19 @@ class _LocationBatchSampler(Sampler[List[int]]):
         for _, indices in self.loc_to_indices.items():
             total += math.ceil(len(indices) / self.batch_size)
         rank, world_size = self._get_dist_env()
-        if total <= rank:
+        if world_size <= 1:
+            return total
+        if total == 0:
             return 0
-        return (total - rank + world_size - 1) // world_size
+        remainder = total % world_size
+        if remainder != 0:
+            if self.ddp_even_strategy == 'pad' or total < world_size:
+                total = total + (world_size - remainder)
+            else:
+                total = total - remainder
+        if total == 0:
+            return 0
+        return total // world_size
 
 
 class InteractionDIGIRDataModule(pl.LightningDataModule):
@@ -92,8 +131,10 @@ class InteractionDIGIRDataModule(pl.LightningDataModule):
             use_kg: bool = True,
             batch_by_location: bool = False,
             location_batch_seed: int = 0,
+            ddp_even_strategy: str = 'drop',
             allow_test_as_val: bool = False,
             require_test_split: bool = False,
+            locations: Optional[str] = None,
             train_transform: Optional[Callable] = None,
             val_transform: Optional[Callable] = None,
             test_transform: Optional[Callable] = None,
@@ -115,8 +156,16 @@ class InteractionDIGIRDataModule(pl.LightningDataModule):
         self.use_kg = use_kg
         self.batch_by_location = batch_by_location
         self.location_batch_seed = location_batch_seed
+        self.ddp_even_strategy = ddp_even_strategy
         self.allow_test_as_val = allow_test_as_val
         self.require_test_split = require_test_split
+        if isinstance(locations, str):
+            parsed_locations = [x.strip() for x in locations.split(',') if x.strip()]
+            self.locations = parsed_locations if parsed_locations else None
+        elif isinstance(locations, list):
+            self.locations = [str(x) for x in locations]
+        else:
+            self.locations = None
         self.train_transform = (
             train_transform if train_transform is not None else TargetBuilder(num_historical_steps, num_future_steps))
         self.val_transform = (
@@ -132,7 +181,8 @@ class InteractionDIGIRDataModule(pl.LightningDataModule):
             num_future_steps=self.num_future_steps,
             max_samples=1,
             use_kg=self.use_kg,
-            allow_test_as_val=self.allow_test_as_val)
+            allow_test_as_val=self.allow_test_as_val,
+            locations=self.locations)
         InteractionDIGIRDataset(
             data_path=self.interaction_data_path,
             split='val',
@@ -141,7 +191,8 @@ class InteractionDIGIRDataModule(pl.LightningDataModule):
             num_future_steps=self.num_future_steps,
             max_samples=1,
             use_kg=self.use_kg,
-            allow_test_as_val=self.allow_test_as_val)
+            allow_test_as_val=self.allow_test_as_val,
+            locations=self.locations)
         if self.require_test_split:
             InteractionDIGIRDataset(
                 data_path=self.interaction_data_path,
@@ -151,7 +202,8 @@ class InteractionDIGIRDataModule(pl.LightningDataModule):
                 num_future_steps=self.num_future_steps,
                 max_samples=1,
                 use_kg=self.use_kg,
-                allow_test_as_val=self.allow_test_as_val)
+                allow_test_as_val=self.allow_test_as_val,
+                locations=self.locations)
 
     def setup(self, stage: Optional[str] = None) -> None:
         if stage is None or stage in ('fit', 'validate'):
@@ -163,7 +215,8 @@ class InteractionDIGIRDataModule(pl.LightningDataModule):
                 num_future_steps=self.num_future_steps,
                 max_samples=self.train_max_samples,
                 use_kg=self.use_kg,
-                allow_test_as_val=self.allow_test_as_val)
+                allow_test_as_val=self.allow_test_as_val,
+                locations=self.locations)
             self.val_dataset = InteractionDIGIRDataset(
                 data_path=self.interaction_data_path,
                 split='val',
@@ -172,7 +225,8 @@ class InteractionDIGIRDataModule(pl.LightningDataModule):
                 num_future_steps=self.num_future_steps,
                 max_samples=self.val_max_samples,
                 use_kg=self.use_kg,
-                allow_test_as_val=self.allow_test_as_val)
+                allow_test_as_val=self.allow_test_as_val,
+                locations=self.locations)
         if stage in ('test', 'predict'):
             self.test_dataset = InteractionDIGIRDataset(
                 data_path=self.interaction_data_path,
@@ -182,7 +236,8 @@ class InteractionDIGIRDataModule(pl.LightningDataModule):
                 num_future_steps=self.num_future_steps,
                 max_samples=self.test_max_samples,
                 use_kg=self.use_kg,
-                allow_test_as_val=self.allow_test_as_val)
+                allow_test_as_val=self.allow_test_as_val,
+                locations=self.locations)
 
     def train_dataloader(self):
         if self.batch_by_location:
@@ -190,7 +245,8 @@ class InteractionDIGIRDataModule(pl.LightningDataModule):
                 locations=self.train_dataset.sample_locations,
                 batch_size=self.train_batch_size,
                 shuffle=self.shuffle,
-                seed=self.location_batch_seed)
+                seed=self.location_batch_seed,
+                ddp_even_strategy=self.ddp_even_strategy)
             return DataLoader(
                 self.train_dataset,
                 batch_sampler=batch_sampler,
@@ -211,7 +267,8 @@ class InteractionDIGIRDataModule(pl.LightningDataModule):
                 locations=self.val_dataset.sample_locations,
                 batch_size=self.val_batch_size,
                 shuffle=False,
-                seed=self.location_batch_seed)
+                seed=self.location_batch_seed,
+                ddp_even_strategy=self.ddp_even_strategy)
             return DataLoader(
                 self.val_dataset,
                 batch_sampler=batch_sampler,
@@ -235,7 +292,8 @@ class InteractionDIGIRDataModule(pl.LightningDataModule):
                 locations=self.test_dataset.sample_locations,
                 batch_size=self.test_batch_size,
                 shuffle=False,
-                seed=self.location_batch_seed)
+                seed=self.location_batch_seed,
+                ddp_even_strategy=self.ddp_even_strategy)
             return DataLoader(
                 self.test_dataset,
                 batch_sampler=batch_sampler,

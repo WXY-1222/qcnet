@@ -40,6 +40,8 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, required=True)
     parser.add_argument('--root', type=str, default='.')
     parser.add_argument('--interaction_data_path', type=str, default=None)
+    parser.add_argument('--locations', type=str, default=None,
+                        help='Comma-separated location names for filtering interaction samples')
     parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'])
     parser.add_argument('--max_samples', type=int, default=None)
     parser.add_argument('--use_kg', type=_str2bool, default=True)
@@ -71,7 +73,8 @@ if __name__ == '__main__':
             num_future_steps=model.num_future_steps,
             max_samples=args.max_samples,
             use_kg=args.use_kg,
-            allow_test_as_val=args.allow_test_as_val)
+            allow_test_as_val=args.allow_test_as_val,
+            locations=[x.strip() for x in args.locations.split(',') if x.strip()] if args.locations else None)
     else:
         test_dataset = dataset_cls(root=args.root, split='test')
     dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
