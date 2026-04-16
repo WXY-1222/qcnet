@@ -122,6 +122,12 @@ if __name__ == '__main__':
         max_epochs=args.max_epochs,
         check_val_every_n_epoch=args.check_val_every_n_epoch,
     )
+    # IMPORTANT:
+    # For custom location-aware batch sampler, Lightning's automatic distributed
+    # sampler injection must be disabled; otherwise it raises TypeError during
+    # sanity-check dataloader setup.
+    if args.dataset == 'interaction_digir' and args.batch_by_location:
+        trainer_kwargs['use_distributed_sampler'] = False
     if args.save_root is not None:
         trainer_kwargs['default_root_dir'] = args.save_root
     if args.eval_batches > 0:
