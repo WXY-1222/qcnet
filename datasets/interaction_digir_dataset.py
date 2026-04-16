@@ -33,7 +33,8 @@ class InteractionDIGIRDataset(Dataset):
             num_historical_steps: int = 8,
             num_future_steps: int = 12,
             max_samples: Optional[int] = None,
-            use_kg: bool = True) -> None:
+            use_kg: bool = True,
+            allow_test_as_val: bool = False) -> None:
         super(InteractionDIGIRDataset, self).__init__()
         self.data_path = os.path.expanduser(os.path.normpath(data_path))
         self.split = split
@@ -51,7 +52,7 @@ class InteractionDIGIRDataset(Dataset):
 
         split_key = split
         if split_key not in payload:
-            if split == 'test' and 'val' in payload:
+            if split == 'test' and allow_test_as_val and 'val' in payload:
                 split_key = 'val'
             else:
                 raise KeyError(f"Split '{split}' not found in {self.data_path}")

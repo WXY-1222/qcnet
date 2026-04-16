@@ -33,6 +33,8 @@ python train_qcnet.py \
   --train_max_samples 5000 \
   --eval_batches 0 \
   --eval_k 5 \
+  --monitor_metric val_minADE \
+  --monitor_mode min \
   --devices 8 \
   --accelerator gpu \
   --num_historical_steps 8 \

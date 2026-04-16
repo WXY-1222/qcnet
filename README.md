@@ -108,9 +108,14 @@ For INTERACTION runs, use:
 - `--dataset interaction_digir`
 - `--num_historical_steps 8`
 - `--num_future_steps 12`
+- `--batch_by_location` for location-homogeneous batches
 
 Validation metrics are still QCNet's `val_minADE`, `val_minFDE`, and `val_MR`, which are the kinematic core metrics for DIGIR-style comparison.
 Set `--eval_k 5` during training if you want strict DIGIR `k=5` alignment (then these three metrics are computed at K=5).
+Set `--monitor_metric val_minADE` if you want checkpoint selection aligned to ADE-first reporting.
+
+By default, INTERACTION test split is strict: missing `test` in the pickle raises an error.
+If you explicitly want to reuse `val` as `test`, pass `--allow_test_as_val`.
 
 DIGIR-aligned one-command training script:
 ```bash
