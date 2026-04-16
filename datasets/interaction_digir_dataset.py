@@ -62,6 +62,7 @@ class InteractionDIGIRDataset(Dataset):
         if max_samples is not None and max_samples > 0:
             split_samples = split_samples[:max_samples]
         self.samples: List[Dict[str, Any]] = split_samples
+        self.sample_locations: List[str] = [str(s.get('location_name', 'UNKNOWN')) for s in self.samples]
 
         self.kg_default = payload.get('kg', None)
         self.kg_per_location = payload.get('kg_per_location', {}) or {}

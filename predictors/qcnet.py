@@ -69,8 +69,9 @@ class QCNet(pl.LightningModule):
                  lr: float,
                  weight_decay: float,
                  T_max: int,
-                 submission_dir: str,
-                 submission_file_name: str,
+                 eval_k: int = 6,
+                 submission_dir: str = './',
+                 submission_file_name: str = 'submission',
                  **kwargs) -> None:
         super(QCNet, self).__init__()
         self.save_hyperparameters()
@@ -100,6 +101,7 @@ class QCNet(pl.LightningModule):
         self.lr = lr
         self.weight_decay = weight_decay
         self.T_max = T_max
+        self.eval_k = eval_k
         self.submission_dir = submission_dir
         self.submission_file_name = submission_file_name
 
@@ -144,12 +146,12 @@ class QCNet(pl.LightningModule):
         self.cls_loss = MixtureNLLLoss(component_distribution=['laplace'] * output_dim + ['von_mises'] * output_head,
                                        reduction='none')
 
-        self.Brier = Brier(max_guesses=6)
-        self.minADE = minADE(max_guesses=6)
-        self.minAHE = minAHE(max_guesses=6)
-        self.minFDE = minFDE(max_guesses=6)
-        self.minFHE = minFHE(max_guesses=6)
-        self.MR = MR(max_guesses=6)
+        self.Brier = Brier(max_guesses=eval_k)
+        self.minADE = minADE(max_guesses=eval_k)
+        self.minAHE = minAHE(max_guesses=eval_k)
+        self.minFDE = minFDE(max_guesses=eval_k)
+        self.minFHE = minFHE(max_guesses=eval_k)
+        self.MR = MR(max_guesses=eval_k)
 
         self.test_predictions = dict()
 
@@ -404,6 +406,7 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--lr', type=float, default=5e-4)
         parser.add_argument('--weight_decay', type=float, default=1e-4)
         parser.add_argument('--T_max', type=int, default=64)
+        parser.add_argument('--eval_k', type=int, default=6)
         parser.add_argument('--submission_dir', type=str, default='./')
         parser.add_argument('--submission_file_name', type=str, default='submission')
         return parent_parser

@@ -110,6 +110,12 @@ For INTERACTION runs, use:
 - `--num_future_steps 12`
 
 Validation metrics are still QCNet's `val_minADE`, `val_minFDE`, and `val_MR`, which are the kinematic core metrics for DIGIR-style comparison.
+Set `--eval_k 5` during training if you want strict DIGIR `k=5` alignment (then these three metrics are computed at K=5).
+
+DIGIR-aligned one-command training script:
+```bash
+bash scripts/train_qcnet_interaction_digir_aligned.sh
+```
 
 ## Pretrained Models & Results
 
