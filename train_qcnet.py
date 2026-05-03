@@ -19,6 +19,7 @@ import os
 import subprocess
 
 import pytorch_lightning as pl
+import torch
 from pytorch_lightning.callbacks import LearningRateMonitor
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.strategies import DDPStrategy
@@ -81,6 +82,8 @@ if __name__ == '__main__':
                         help='Optional checkpoint path for resuming or fine-tuning')
     parser.add_argument('--init_from_checkpoint', type=str, default=None,
                         help='Load model weights from a checkpoint but start a fresh optimizer/schedule')
+    parser.add_argument('--init_encoder_from_checkpoint', type=str, default=None,
+                        help='Load only encoder.* weights from a checkpoint and initialize the decoder from scratch')
     QCNet.add_model_specific_args(parser)
     args = parser.parse_args()
     if args.location_batch_seed is None:
@@ -90,10 +93,22 @@ if __name__ == '__main__':
     if args.dataset == 'interaction_digir' and args.interaction_data_path is None:
         raise ValueError('--interaction_data_path is required when --dataset interaction_digir')
 
+    if args.init_from_checkpoint and args.init_encoder_from_checkpoint:
+        raise ValueError('Use only one of --init_from_checkpoint and --init_encoder_from_checkpoint')
+
     if args.init_from_checkpoint:
         model = QCNet.load_from_checkpoint(checkpoint_path=args.init_from_checkpoint, **vars(args))
     else:
         model = QCNet(**vars(args))
+        if args.init_encoder_from_checkpoint:
+            ckpt = torch.load(args.init_encoder_from_checkpoint, map_location='cpu')
+            state_dict = ckpt.get('state_dict', ckpt)
+            encoder_state = {k: v for k, v in state_dict.items() if k.startswith('encoder.')}
+            incompatible = model.load_state_dict(encoder_state, strict=False)
+            print('[InitEncoder] loaded {} encoder tensors from {}'.format(
+                len(encoder_state), args.init_encoder_from_checkpoint))
+            print('[InitEncoder] missing={} unexpected={}'.format(
+                len(incompatible.missing_keys), len(incompatible.unexpected_keys)))
     datamodule = {
         'argoverse_v2': ArgoverseV2DataModule,
         'interaction_digir': InteractionDIGIRDataModule,

@@ -33,6 +33,7 @@ from metrics import minFDE
 from metrics import minFHE
 from modules import QCNetDecoder
 from modules import QCNetEncoder
+from modules import TopoSSMDecoder
 
 try:
     from av2.datasets.motion_forecasting.eval.submission import ChallengeSubmission
@@ -80,6 +81,7 @@ class QCNet(pl.LightningModule):
                  topo_corridor_loss_weight: float = 0.0,
                  topo_score_loss_weight: float = 0.0,
                  topo_score_temperature: float = 0.2,
+                 decoder_type: str = 'qcnet',
                  eval_k: int = 6,
                  submission_dir: str = './',
                  submission_file_name: str = 'submission',
@@ -123,6 +125,7 @@ class QCNet(pl.LightningModule):
         self.topo_corridor_loss_weight = topo_corridor_loss_weight
         self.topo_score_loss_weight = topo_score_loss_weight
         self.topo_score_temperature = topo_score_temperature
+        self.decoder_type = decoder_type
         self.eval_k = eval_k
         self.submission_dir = submission_dir
         self.submission_file_name = submission_file_name
@@ -143,33 +146,51 @@ class QCNet(pl.LightningModule):
             head_dim=head_dim,
             dropout=dropout,
         )
-        self.decoder = QCNetDecoder(
-            dataset=dataset,
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            output_dim=output_dim,
-            output_head=output_head,
-            num_historical_steps=num_historical_steps,
-            num_future_steps=num_future_steps,
-            num_modes=num_modes,
-            num_recurrent_steps=num_recurrent_steps,
-            num_t2m_steps=num_t2m_steps,
-            pl2m_radius=pl2m_radius,
-            a2m_radius=a2m_radius,
-            num_freq_bands=num_freq_bands,
-            num_layers=num_dec_layers,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            dropout=dropout,
-            enable_topo_ssm_refiner=enable_topo_ssm_refiner,
-            topo_refine_weight=topo_refine_weight,
-            topo_score_weight=topo_score_weight,
-            topo_ssm_layers=topo_ssm_layers,
-            topo_mamba_d_state=topo_mamba_d_state,
-            topo_mamba_d_conv=topo_mamba_d_conv,
-            topo_mamba_expand=topo_mamba_expand,
-            topo_zero_init=topo_zero_init,
-        )
+        if decoder_type == 'qcnet':
+            self.decoder = QCNetDecoder(
+                dataset=dataset,
+                input_dim=input_dim,
+                hidden_dim=hidden_dim,
+                output_dim=output_dim,
+                output_head=output_head,
+                num_historical_steps=num_historical_steps,
+                num_future_steps=num_future_steps,
+                num_modes=num_modes,
+                num_recurrent_steps=num_recurrent_steps,
+                num_t2m_steps=num_t2m_steps,
+                pl2m_radius=pl2m_radius,
+                a2m_radius=a2m_radius,
+                num_freq_bands=num_freq_bands,
+                num_layers=num_dec_layers,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                dropout=dropout,
+                enable_topo_ssm_refiner=enable_topo_ssm_refiner,
+                topo_refine_weight=topo_refine_weight,
+                topo_score_weight=topo_score_weight,
+                topo_ssm_layers=topo_ssm_layers,
+                topo_mamba_d_state=topo_mamba_d_state,
+                topo_mamba_d_conv=topo_mamba_d_conv,
+                topo_mamba_expand=topo_mamba_expand,
+                topo_zero_init=topo_zero_init,
+            )
+        elif decoder_type == 'topossm':
+            self.decoder = TopoSSMDecoder(
+                input_dim=input_dim,
+                hidden_dim=hidden_dim,
+                output_dim=output_dim,
+                output_head=output_head,
+                num_historical_steps=num_historical_steps,
+                num_future_steps=num_future_steps,
+                num_modes=num_modes,
+                topo_ssm_layers=topo_ssm_layers,
+                topo_mamba_d_state=topo_mamba_d_state,
+                topo_mamba_d_conv=topo_mamba_d_conv,
+                topo_mamba_expand=topo_mamba_expand,
+                dropout=dropout,
+            )
+        else:
+            raise ValueError(f'{decoder_type} is not a valid decoder_type')
 
         self.reg_loss = NLLLoss(component_distribution=['laplace'] * output_dim + ['von_mises'] * output_head,
                                 reduction='none')
@@ -497,6 +518,7 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--topo_corridor_loss_weight', type=float, default=0.0)
         parser.add_argument('--topo_score_loss_weight', type=float, default=0.0)
         parser.add_argument('--topo_score_temperature', type=float, default=0.2)
+        parser.add_argument('--decoder_type', type=str, default='qcnet', choices=['qcnet', 'topossm'])
         parser.add_argument('--eval_k', type=int, default=6)
         parser.add_argument('--submission_dir', type=str, default='./')
         parser.add_argument('--submission_file_name', type=str, default='submission')
