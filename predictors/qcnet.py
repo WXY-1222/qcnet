@@ -77,6 +77,9 @@ class QCNet(pl.LightningModule):
                  topo_mamba_d_conv: int = 4,
                  topo_mamba_expand: int = 2,
                  topo_zero_init: bool = True,
+                 topo_corridor_loss_weight: float = 0.0,
+                 topo_score_loss_weight: float = 0.0,
+                 topo_score_temperature: float = 0.2,
                  eval_k: int = 6,
                  submission_dir: str = './',
                  submission_file_name: str = 'submission',
@@ -117,6 +120,9 @@ class QCNet(pl.LightningModule):
         self.topo_mamba_d_conv = topo_mamba_d_conv
         self.topo_mamba_expand = topo_mamba_expand
         self.topo_zero_init = topo_zero_init
+        self.topo_corridor_loss_weight = topo_corridor_loss_weight
+        self.topo_score_loss_weight = topo_score_loss_weight
+        self.topo_score_temperature = topo_score_temperature
         self.eval_k = eval_k
         self.submission_dir = submission_dir
         self.submission_file_name = submission_file_name
@@ -226,10 +232,26 @@ class QCNet(pl.LightningModule):
                                  prob=pi,
                                  mask=reg_mask[:, -1:]) * cls_mask
         cls_loss = cls_loss.sum() / cls_mask.sum().clamp_(min=1)
+        topo_corridor_loss, topo_score_loss = self._topology_aux_losses(
+            pred=pred,
+            pi=pi,
+            best_mode=best_mode,
+            reg_mask=reg_mask,
+            cls_mask=cls_mask)
         self.log('train_reg_loss_propose', reg_loss_propose, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_reg_loss_refine', reg_loss_refine, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_cls_loss', cls_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+        if topo_corridor_loss is not None:
+            self.log('train_topo_corridor_loss', topo_corridor_loss, prog_bar=False, on_step=True, on_epoch=True,
+                     batch_size=1)
+        if topo_score_loss is not None:
+            self.log('train_topo_score_loss', topo_score_loss, prog_bar=False, on_step=True, on_epoch=True,
+                     batch_size=1)
         loss = reg_loss_propose + reg_loss_refine + cls_loss
+        if topo_corridor_loss is not None:
+            loss = loss + self.topo_corridor_loss_weight * topo_corridor_loss
+        if topo_score_loss is not None:
+            loss = loss + self.topo_score_loss_weight * topo_score_loss
         return loss
 
     def validation_step(self,
@@ -274,11 +296,23 @@ class QCNet(pl.LightningModule):
                                  prob=pi,
                                  mask=reg_mask[:, -1:]) * cls_mask
         cls_loss = cls_loss.sum() / cls_mask.sum().clamp_(min=1)
+        topo_corridor_loss, topo_score_loss = self._topology_aux_losses(
+            pred=pred,
+            pi=pi,
+            best_mode=best_mode,
+            reg_mask=reg_mask,
+            cls_mask=cls_mask)
         self.log('val_reg_loss_propose', reg_loss_propose, prog_bar=True, on_step=False, on_epoch=True, batch_size=1,
                  sync_dist=True)
         self.log('val_reg_loss_refine', reg_loss_refine, prog_bar=True, on_step=False, on_epoch=True, batch_size=1,
                  sync_dist=True)
         self.log('val_cls_loss', cls_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+        if topo_corridor_loss is not None:
+            self.log('val_topo_corridor_loss', topo_corridor_loss, prog_bar=True, on_step=False, on_epoch=True,
+                     batch_size=1, sync_dist=True)
+        if topo_score_loss is not None:
+            self.log('val_topo_score_loss', topo_score_loss, prog_bar=False, on_step=False, on_epoch=True,
+                     batch_size=1, sync_dist=True)
 
         if self.dataset in ('argoverse_v2', 'interaction_digir'):
             eval_mask = data['agent']['category'] == 3
@@ -401,6 +435,28 @@ class QCNet(pl.LightningModule):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=self.T_max, eta_min=0.0)
         return [optimizer], [scheduler]
 
+    def _topology_aux_losses(self,
+                             pred,
+                             pi: torch.Tensor,
+                             best_mode: torch.Tensor,
+                             reg_mask: torch.Tensor,
+                             cls_mask: torch.Tensor):
+        if 'topo_corridor_dist' not in pred:
+            return None, None
+        corridor_dist = pred['topo_corridor_dist']
+        batch_idx = torch.arange(corridor_dist.size(0), device=corridor_dist.device)
+        mode_dist = corridor_dist[batch_idx, best_mode]
+        reg_mask_f = reg_mask.to(dtype=mode_dist.dtype)
+        denom = reg_mask_f.sum().clamp_(min=1.0)
+        corridor_loss = (mode_dist * reg_mask_f).sum() / denom
+
+        valid_steps = reg_mask_f.unsqueeze(1)
+        mode_mean_dist = (corridor_dist * valid_steps).sum(dim=-1) / valid_steps.sum(dim=-1).clamp_(min=1.0)
+        target = F.softmax(-mode_mean_dist / max(float(self.topo_score_temperature), 1e-4), dim=-1).detach()
+        score_loss = F.kl_div(F.log_softmax(pi, dim=-1), target, reduction='none').sum(dim=-1)
+        score_loss = (score_loss * cls_mask.to(dtype=score_loss.dtype)).sum() / cls_mask.sum().clamp_(min=1)
+        return corridor_loss, score_loss
+
     @staticmethod
     def add_model_specific_args(parent_parser):
         parser = parent_parser.add_argument_group('QCNet')
@@ -438,6 +494,9 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--topo_mamba_d_conv', type=int, default=4)
         parser.add_argument('--topo_mamba_expand', type=int, default=2)
         parser.add_argument('--topo_zero_init', type=bool, default=True)
+        parser.add_argument('--topo_corridor_loss_weight', type=float, default=0.0)
+        parser.add_argument('--topo_score_loss_weight', type=float, default=0.0)
+        parser.add_argument('--topo_score_temperature', type=float, default=0.2)
         parser.add_argument('--eval_k', type=int, default=6)
         parser.add_argument('--submission_dir', type=str, default='./')
         parser.add_argument('--submission_file_name', type=str, default='submission')

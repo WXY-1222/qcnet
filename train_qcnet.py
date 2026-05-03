@@ -77,6 +77,10 @@ if __name__ == '__main__':
                         help='0 for full validation; >0 limits number of val batches per epoch')
     parser.add_argument('--monitor_metric', type=str, default='val_minADE')
     parser.add_argument('--monitor_mode', type=str, default='min', choices=['min', 'max'])
+    parser.add_argument('--ckpt_path', type=str, default=None,
+                        help='Optional checkpoint path for resuming or fine-tuning')
+    parser.add_argument('--init_from_checkpoint', type=str, default=None,
+                        help='Load model weights from a checkpoint but start a fresh optimizer/schedule')
     QCNet.add_model_specific_args(parser)
     args = parser.parse_args()
     if args.location_batch_seed is None:
@@ -86,7 +90,10 @@ if __name__ == '__main__':
     if args.dataset == 'interaction_digir' and args.interaction_data_path is None:
         raise ValueError('--interaction_data_path is required when --dataset interaction_digir')
 
-    model = QCNet(**vars(args))
+    if args.init_from_checkpoint:
+        model = QCNet.load_from_checkpoint(checkpoint_path=args.init_from_checkpoint, **vars(args))
+    else:
+        model = QCNet(**vars(args))
     datamodule = {
         'argoverse_v2': ArgoverseV2DataModule,
         'interaction_digir': InteractionDIGIRDataModule,
@@ -135,4 +142,4 @@ if __name__ == '__main__':
     else:
         trainer_kwargs['limit_val_batches'] = 1.0
     trainer = pl.Trainer(**trainer_kwargs)
-    trainer.fit(model, datamodule)
+    trainer.fit(model, datamodule, ckpt_path=args.ckpt_path)
