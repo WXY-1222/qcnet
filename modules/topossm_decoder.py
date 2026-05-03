@@ -50,6 +50,7 @@ class TopoSSMDecoder(nn.Module):
                  topo_proposal_type: str = 'goal_mlp',
                  topo_goal_distance_weight: float = 0.05,
                  topo_goal_residual_scale: float = 0.25,
+                 topo_goal_anchor_blend: float = 1.0,
                  corridor_dist_norm: float = 50.0) -> None:
         super(TopoSSMDecoder, self).__init__()
         self.input_dim = input_dim
@@ -62,6 +63,7 @@ class TopoSSMDecoder(nn.Module):
         self.topo_proposal_type = topo_proposal_type
         self.topo_goal_distance_weight = topo_goal_distance_weight
         self.topo_goal_residual_scale = topo_goal_residual_scale
+        self.topo_goal_anchor_blend = topo_goal_anchor_blend
         self.corridor_dist_norm = corridor_dist_norm
         if topo_proposal_type not in ('goal_mlp', 'corridor_goal'):
             raise ValueError(f'{topo_proposal_type} is not a valid topo_proposal_type')
@@ -271,7 +273,9 @@ class TopoSSMDecoder(nn.Module):
         selected_global = map_pos[selected]
         selected_local = self._global_to_local(selected_global, agent_origin[:, :2], agent_heading)
         residual = self.topo_goal_residual_scale * torch.tanh(fallback_goal)
-        return selected_local + residual
+        hard_goal = selected_local + residual
+        blend = max(0.0, min(float(self.topo_goal_anchor_blend), 1.0))
+        return fallback_goal + blend * (hard_goal - fallback_goal)
 
     def _extract_corridors(self,
                            data: HeteroData,
