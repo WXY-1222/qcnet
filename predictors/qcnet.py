@@ -69,6 +69,14 @@ class QCNet(pl.LightningModule):
                  lr: float,
                  weight_decay: float,
                  T_max: int,
+                 enable_topo_ssm_refiner: bool = False,
+                 topo_refine_weight: float = 0.1,
+                 topo_score_weight: float = 0.1,
+                 topo_ssm_layers: int = 1,
+                 topo_mamba_d_state: int = 16,
+                 topo_mamba_d_conv: int = 4,
+                 topo_mamba_expand: int = 2,
+                 topo_zero_init: bool = True,
                  eval_k: int = 6,
                  submission_dir: str = './',
                  submission_file_name: str = 'submission',
@@ -101,6 +109,14 @@ class QCNet(pl.LightningModule):
         self.lr = lr
         self.weight_decay = weight_decay
         self.T_max = T_max
+        self.enable_topo_ssm_refiner = enable_topo_ssm_refiner
+        self.topo_refine_weight = topo_refine_weight
+        self.topo_score_weight = topo_score_weight
+        self.topo_ssm_layers = topo_ssm_layers
+        self.topo_mamba_d_state = topo_mamba_d_state
+        self.topo_mamba_d_conv = topo_mamba_d_conv
+        self.topo_mamba_expand = topo_mamba_expand
+        self.topo_zero_init = topo_zero_init
         self.eval_k = eval_k
         self.submission_dir = submission_dir
         self.submission_file_name = submission_file_name
@@ -139,6 +155,14 @@ class QCNet(pl.LightningModule):
             num_heads=num_heads,
             head_dim=head_dim,
             dropout=dropout,
+            enable_topo_ssm_refiner=enable_topo_ssm_refiner,
+            topo_refine_weight=topo_refine_weight,
+            topo_score_weight=topo_score_weight,
+            topo_ssm_layers=topo_ssm_layers,
+            topo_mamba_d_state=topo_mamba_d_state,
+            topo_mamba_d_conv=topo_mamba_d_conv,
+            topo_mamba_expand=topo_mamba_expand,
+            topo_zero_init=topo_zero_init,
         )
 
         self.reg_loss = NLLLoss(component_distribution=['laplace'] * output_dim + ['von_mises'] * output_head,
@@ -406,6 +430,14 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--lr', type=float, default=5e-4)
         parser.add_argument('--weight_decay', type=float, default=1e-4)
         parser.add_argument('--T_max', type=int, default=64)
+        parser.add_argument('--enable_topo_ssm_refiner', action='store_true')
+        parser.add_argument('--topo_refine_weight', type=float, default=0.1)
+        parser.add_argument('--topo_score_weight', type=float, default=0.1)
+        parser.add_argument('--topo_ssm_layers', type=int, default=1)
+        parser.add_argument('--topo_mamba_d_state', type=int, default=16)
+        parser.add_argument('--topo_mamba_d_conv', type=int, default=4)
+        parser.add_argument('--topo_mamba_expand', type=int, default=2)
+        parser.add_argument('--topo_zero_init', type=bool, default=True)
         parser.add_argument('--eval_k', type=int, default=6)
         parser.add_argument('--submission_dir', type=str, default='./')
         parser.add_argument('--submission_file_name', type=str, default='submission')
