@@ -84,6 +84,8 @@ if __name__ == '__main__':
                         help='Load model weights from a checkpoint but start a fresh optimizer/schedule')
     parser.add_argument('--init_encoder_from_checkpoint', type=str, default=None,
                         help='Load only encoder.* weights from a checkpoint and initialize the decoder from scratch')
+    parser.add_argument('--distill_teacher_checkpoint', type=str, default=None,
+                        help='Frozen teacher checkpoint used for trajectory/score distillation during training')
     QCNet.add_model_specific_args(parser)
     args = parser.parse_args()
     if args.location_batch_seed is None:
@@ -109,6 +111,15 @@ if __name__ == '__main__':
                 len(encoder_state), args.init_encoder_from_checkpoint))
             print('[InitEncoder] missing={} unexpected={}'.format(
                 len(incompatible.missing_keys), len(incompatible.unexpected_keys)))
+    if args.distill_teacher_checkpoint:
+        teacher = QCNet.load_from_checkpoint(
+            checkpoint_path=args.distill_teacher_checkpoint,
+            map_location='cpu')
+        teacher.eval()
+        for param in teacher.parameters():
+            param.requires_grad_(False)
+        model.teacher_model = teacher
+        print('[DistillTeacher] loaded frozen teacher from {}'.format(args.distill_teacher_checkpoint))
     datamodule = {
         'argoverse_v2': ArgoverseV2DataModule,
         'interaction_digir': InteractionDIGIRDataModule,

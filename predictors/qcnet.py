@@ -82,6 +82,11 @@ class QCNet(pl.LightningModule):
                  topo_score_loss_weight: float = 0.0,
                  topo_score_temperature: float = 0.2,
                  decoder_type: str = 'qcnet',
+                 distill_propose_weight: float = 0.0,
+                 distill_refine_weight: float = 0.0,
+                 distill_score_weight: float = 0.0,
+                 distill_temperature: float = 1.0,
+                 distill_warmup_epochs: int = 0,
                  eval_k: int = 6,
                  submission_dir: str = './',
                  submission_file_name: str = 'submission',
@@ -126,6 +131,12 @@ class QCNet(pl.LightningModule):
         self.topo_score_loss_weight = topo_score_loss_weight
         self.topo_score_temperature = topo_score_temperature
         self.decoder_type = decoder_type
+        self.distill_propose_weight = distill_propose_weight
+        self.distill_refine_weight = distill_refine_weight
+        self.distill_score_weight = distill_score_weight
+        self.distill_temperature = distill_temperature
+        self.distill_warmup_epochs = distill_warmup_epochs
+        self.teacher_model = None
         self.eval_k = eval_k
         self.submission_dir = submission_dir
         self.submission_file_name = submission_file_name
@@ -259,6 +270,12 @@ class QCNet(pl.LightningModule):
             best_mode=best_mode,
             reg_mask=reg_mask,
             cls_mask=cls_mask)
+        distill_losses = self._teacher_distill_losses(
+            data=data,
+            pred=pred,
+            pi=pi,
+            reg_mask=reg_mask,
+            cls_mask=cls_mask)
         self.log('train_reg_loss_propose', reg_loss_propose, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_reg_loss_refine', reg_loss_refine, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_cls_loss', cls_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
@@ -268,11 +285,19 @@ class QCNet(pl.LightningModule):
         if topo_score_loss is not None:
             self.log('train_topo_score_loss', topo_score_loss, prog_bar=False, on_step=True, on_epoch=True,
                      batch_size=1)
+        for name, loss_value in distill_losses.items():
+            self.log(f'train_{name}', loss_value, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         loss = reg_loss_propose + reg_loss_refine + cls_loss
         if topo_corridor_loss is not None:
             loss = loss + self.topo_corridor_loss_weight * topo_corridor_loss
         if topo_score_loss is not None:
             loss = loss + self.topo_score_loss_weight * topo_score_loss
+        distill_scale = self._distill_scale()
+        if distill_losses:
+            loss = loss + distill_scale * (
+                self.distill_propose_weight * distill_losses.get('distill_propose_loss', 0.0) +
+                self.distill_refine_weight * distill_losses.get('distill_refine_loss', 0.0) +
+                self.distill_score_weight * distill_losses.get('distill_score_loss', 0.0))
         return loss
 
     def validation_step(self,
@@ -429,6 +454,8 @@ class QCNet(pl.LightningModule):
         blacklist_weight_modules = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.LayerNorm, nn.Embedding)
         for module_name, module in self.named_modules():
             for param_name, param in module.named_parameters():
+                if not param.requires_grad:
+                    continue
                 full_param_name = '%s.%s' % (module_name, param_name) if module_name else param_name
                 if 'bias' in param_name:
                     no_decay.add(full_param_name)
@@ -439,7 +466,7 @@ class QCNet(pl.LightningModule):
                         no_decay.add(full_param_name)
                 elif not ('weight' in param_name or 'bias' in param_name):
                     no_decay.add(full_param_name)
-        param_dict = {param_name: param for param_name, param in self.named_parameters()}
+        param_dict = {param_name: param for param_name, param in self.named_parameters() if param.requires_grad}
         inter_params = decay & no_decay
         union_params = decay | no_decay
         assert len(inter_params) == 0
@@ -455,6 +482,14 @@ class QCNet(pl.LightningModule):
         optimizer = torch.optim.AdamW(optim_groups, lr=self.lr, weight_decay=self.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=self.T_max, eta_min=0.0)
         return [optimizer], [scheduler]
+
+    def on_save_checkpoint(self, checkpoint):
+        # The teacher is a frozen training aid, not part of the student model.
+        if 'state_dict' in checkpoint:
+            checkpoint['state_dict'] = {
+                k: v for k, v in checkpoint['state_dict'].items()
+                if not k.startswith('teacher_model.')
+            }
 
     def _topology_aux_losses(self,
                              pred,
@@ -477,6 +512,67 @@ class QCNet(pl.LightningModule):
         score_loss = F.kl_div(F.log_softmax(pi, dim=-1), target, reduction='none').sum(dim=-1)
         score_loss = (score_loss * cls_mask.to(dtype=score_loss.dtype)).sum() / cls_mask.sum().clamp_(min=1)
         return corridor_loss, score_loss
+
+    def _distill_scale(self) -> float:
+        if self.distill_warmup_epochs <= 0:
+            return 1.0
+        return min(1.0, float(self.current_epoch + 1) / float(self.distill_warmup_epochs))
+
+    def _teacher_distill_losses(self,
+                                data,
+                                pred,
+                                pi: torch.Tensor,
+                                reg_mask: torch.Tensor,
+                                cls_mask: torch.Tensor):
+        if self.teacher_model is None:
+            return {}
+        if self.distill_propose_weight <= 0.0 and self.distill_refine_weight <= 0.0 and self.distill_score_weight <= 0.0:
+            return {}
+
+        self.teacher_model.eval()
+        with torch.no_grad():
+            teacher_pred = self.teacher_model(data)
+
+        valid = reg_mask.to(dtype=pi.dtype)
+        valid_count = valid.sum(dim=-1).clamp(min=1.0)
+        cls_weight = cls_mask.to(dtype=pi.dtype)
+        cls_den = cls_weight.sum().clamp(min=1.0)
+        temperature = max(float(self.distill_temperature), 1e-4)
+        losses = {}
+
+        def matched_traj_loss(student_pos: torch.Tensor, teacher_pos: torch.Tensor):
+            teacher_prob = F.softmax(teacher_pred['pi'].detach() / temperature, dim=-1)
+            pair_dist = torch.norm(
+                student_pos[:, :, None, :, :self.output_dim] -
+                teacher_pos.detach()[:, None, :, :, :self.output_dim],
+                p=2,
+                dim=-1)
+            pair_ade = (pair_dist * valid[:, None, None]).sum(dim=-1) / valid_count[:, None, None]
+            min_dist, min_student = pair_ade.min(dim=1)
+            loss = (teacher_prob * min_dist).sum(dim=-1)
+            loss = (loss * cls_weight).sum() / cls_den
+            return loss, min_student, teacher_prob
+
+        if self.distill_propose_weight > 0.0:
+            propose_loss, _, _ = matched_traj_loss(pred['loc_propose_pos'], teacher_pred['loc_propose_pos'])
+            losses['distill_propose_loss'] = propose_loss
+
+        if self.distill_refine_weight > 0.0 or self.distill_score_weight > 0.0:
+            refine_loss, assigned_student, teacher_prob = matched_traj_loss(
+                pred['loc_refine_pos'], teacher_pred['loc_refine_pos'])
+            if self.distill_refine_weight > 0.0:
+                losses['distill_refine_loss'] = refine_loss
+            if self.distill_score_weight > 0.0:
+                target_prob = pi.new_zeros(pi.shape)
+                target_prob.scatter_add_(dim=1, index=assigned_student, src=teacher_prob)
+                target_prob = target_prob / target_prob.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+                score_loss = F.kl_div(
+                    F.log_softmax(pi / temperature, dim=-1),
+                    target_prob.detach(),
+                    reduction='none').sum(dim=-1) * (temperature ** 2)
+                score_loss = (score_loss * cls_weight).sum() / cls_den
+                losses['distill_score_loss'] = score_loss
+        return losses
 
     @staticmethod
     def add_model_specific_args(parent_parser):
@@ -519,6 +615,11 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--topo_score_loss_weight', type=float, default=0.0)
         parser.add_argument('--topo_score_temperature', type=float, default=0.2)
         parser.add_argument('--decoder_type', type=str, default='qcnet', choices=['qcnet', 'topossm'])
+        parser.add_argument('--distill_propose_weight', type=float, default=0.0)
+        parser.add_argument('--distill_refine_weight', type=float, default=0.0)
+        parser.add_argument('--distill_score_weight', type=float, default=0.0)
+        parser.add_argument('--distill_temperature', type=float, default=1.0)
+        parser.add_argument('--distill_warmup_epochs', type=int, default=0)
         parser.add_argument('--eval_k', type=int, default=6)
         parser.add_argument('--submission_dir', type=str, default='./')
         parser.add_argument('--submission_file_name', type=str, default='submission')
