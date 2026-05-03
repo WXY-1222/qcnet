@@ -81,6 +81,9 @@ class QCNet(pl.LightningModule):
                  topo_corridor_loss_weight: float = 0.0,
                  topo_score_loss_weight: float = 0.0,
                  topo_score_temperature: float = 0.2,
+                 topo_proposal_type: str = 'goal_mlp',
+                 topo_goal_distance_weight: float = 0.05,
+                 topo_goal_residual_scale: float = 0.25,
                  decoder_type: str = 'qcnet',
                  distill_propose_weight: float = 0.0,
                  distill_refine_weight: float = 0.0,
@@ -130,6 +133,9 @@ class QCNet(pl.LightningModule):
         self.topo_corridor_loss_weight = topo_corridor_loss_weight
         self.topo_score_loss_weight = topo_score_loss_weight
         self.topo_score_temperature = topo_score_temperature
+        self.topo_proposal_type = topo_proposal_type
+        self.topo_goal_distance_weight = topo_goal_distance_weight
+        self.topo_goal_residual_scale = topo_goal_residual_scale
         self.decoder_type = decoder_type
         self.distill_propose_weight = distill_propose_weight
         self.distill_refine_weight = distill_refine_weight
@@ -199,6 +205,9 @@ class QCNet(pl.LightningModule):
                 topo_mamba_d_conv=topo_mamba_d_conv,
                 topo_mamba_expand=topo_mamba_expand,
                 dropout=dropout,
+                topo_proposal_type=topo_proposal_type,
+                topo_goal_distance_weight=topo_goal_distance_weight,
+                topo_goal_residual_scale=topo_goal_residual_scale,
             )
         else:
             raise ValueError(f'{decoder_type} is not a valid decoder_type')
@@ -614,6 +623,9 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--topo_corridor_loss_weight', type=float, default=0.0)
         parser.add_argument('--topo_score_loss_weight', type=float, default=0.0)
         parser.add_argument('--topo_score_temperature', type=float, default=0.2)
+        parser.add_argument('--topo_proposal_type', type=str, default='goal_mlp', choices=['goal_mlp', 'corridor_goal'])
+        parser.add_argument('--topo_goal_distance_weight', type=float, default=0.05)
+        parser.add_argument('--topo_goal_residual_scale', type=float, default=0.25)
         parser.add_argument('--decoder_type', type=str, default='qcnet', choices=['qcnet', 'topossm'])
         parser.add_argument('--distill_propose_weight', type=float, default=0.0)
         parser.add_argument('--distill_refine_weight', type=float, default=0.0)

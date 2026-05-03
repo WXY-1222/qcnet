@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from typing import Dict, Mapping, Tuple
 
 import torch
@@ -46,6 +47,9 @@ class TopoSSMDecoder(nn.Module):
                  topo_mamba_d_conv: int,
                  topo_mamba_expand: int,
                  dropout: float,
+                 topo_proposal_type: str = 'goal_mlp',
+                 topo_goal_distance_weight: float = 0.05,
+                 topo_goal_residual_scale: float = 0.25,
                  corridor_dist_norm: float = 50.0) -> None:
         super(TopoSSMDecoder, self).__init__()
         self.input_dim = input_dim
@@ -55,7 +59,12 @@ class TopoSSMDecoder(nn.Module):
         self.num_historical_steps = num_historical_steps
         self.num_future_steps = num_future_steps
         self.num_modes = num_modes
+        self.topo_proposal_type = topo_proposal_type
+        self.topo_goal_distance_weight = topo_goal_distance_weight
+        self.topo_goal_residual_scale = topo_goal_residual_scale
         self.corridor_dist_norm = corridor_dist_norm
+        if topo_proposal_type not in ('goal_mlp', 'corridor_goal'):
+            raise ValueError(f'{topo_proposal_type} is not a valid topo_proposal_type')
 
         self.mode_emb = nn.Embedding(num_modes, hidden_dim)
         self.query_mlp = nn.Sequential(
@@ -115,7 +124,10 @@ class TopoSSMDecoder(nn.Module):
         mode_state = agent_state.unsqueeze(1) + self.mode_emb.weight.unsqueeze(0)
         mode_state = self.query_mlp(mode_state)
 
-        goal_local = self.to_goal(mode_state)
+        if self.topo_proposal_type == 'corridor_goal':
+            goal_local = self._make_corridor_goals(data, scene_enc, mode_state)
+        else:
+            goal_local = self.to_goal(mode_state)
         anchor_base = self._make_goal_anchors(goal_local)
         anchor_residual = self.to_anchor_residual(mode_state).view(
             -1, self.num_modes, self.num_future_steps, self.output_dim)
@@ -192,6 +204,74 @@ class TopoSSMDecoder(nn.Module):
             dtype=goal_local.dtype,
         )
         return goal_local.unsqueeze(2) * alpha.view(1, 1, self.num_future_steps, 1)
+
+    def _make_corridor_goals(self,
+                             data: HeteroData,
+                             scene_enc: Mapping[str, torch.Tensor],
+                             mode_state: torch.Tensor) -> torch.Tensor:
+        device = mode_state.device
+        dtype = mode_state.dtype
+        fallback_goal = self.to_goal(mode_state)
+        map_pos = data['map_polygon']['position'][:, :2].to(device=device, dtype=dtype)
+        if map_pos.numel() == 0:
+            return fallback_goal
+
+        map_feat = scene_enc['x_pl'][:, -1].to(device=device, dtype=dtype)
+        agent_origin = data['agent']['position'][:, self.num_historical_steps - 1].to(device=device, dtype=dtype)
+        agent_heading = data['agent']['heading'][:, self.num_historical_steps - 1].to(device=device, dtype=dtype)
+        goal_local = fallback_goal.new_empty(fallback_goal.shape)
+
+        if isinstance(data, Batch):
+            agent_batch = data['agent']['batch'].to(device=device)
+            map_batch = data['map_polygon']['batch'].to(device=device)
+            for batch_id in torch.unique(agent_batch, sorted=True):
+                agent_idx = torch.nonzero(agent_batch == batch_id, as_tuple=False).flatten()
+                map_idx = torch.nonzero(map_batch == batch_id, as_tuple=False).flatten()
+                if agent_idx.numel() == 0:
+                    continue
+                if map_idx.numel() == 0:
+                    goal_local[agent_idx] = fallback_goal[agent_idx]
+                    continue
+                goal_local[agent_idx] = self._select_corridor_goals_for_agents(
+                    mode_state[agent_idx],
+                    fallback_goal[agent_idx],
+                    agent_origin[agent_idx],
+                    agent_heading[agent_idx],
+                    map_pos[map_idx],
+                    map_feat[map_idx],
+                )
+        else:
+            goal_local = self._select_corridor_goals_for_agents(
+                mode_state,
+                fallback_goal,
+                agent_origin,
+                agent_heading,
+                map_pos,
+                map_feat,
+            )
+        return goal_local
+
+    def _select_corridor_goals_for_agents(self,
+                                          mode_state: torch.Tensor,
+                                          fallback_goal: torch.Tensor,
+                                          agent_origin: torch.Tensor,
+                                          agent_heading: torch.Tensor,
+                                          map_pos: torch.Tensor,
+                                          map_feat: torch.Tensor) -> torch.Tensor:
+        query_score = torch.einsum('nkh,mh->nkm', mode_state, map_feat) / math.sqrt(self.hidden_dim)
+        fallback_global = self._local_to_global(
+            fallback_goal.unsqueeze(2),
+            agent_origin[:, :2],
+            agent_heading,
+        ).squeeze(2)
+        distance = torch.cdist(fallback_global.reshape(-1, self.output_dim), map_pos).reshape(
+            mode_state.size(0), self.num_modes, -1)
+        score = query_score - self.topo_goal_distance_weight * distance / self.corridor_dist_norm
+        selected = score.argmax(dim=-1)
+        selected_global = map_pos[selected]
+        selected_local = self._global_to_local(selected_global, agent_origin[:, :2], agent_heading)
+        residual = self.topo_goal_residual_scale * torch.tanh(fallback_goal)
+        return selected_local + residual
 
     def _extract_corridors(self,
                            data: HeteroData,
@@ -275,6 +355,19 @@ class TopoSSMDecoder(nn.Module):
         rot[:, 1, 0] = -sin
         rot[:, 1, 1] = cos
         return torch.matmul(local_xy, rot.unsqueeze(1)) + origin[:, :2].view(-1, 1, 1, 2)
+
+    def _global_to_local(self,
+                         global_xy: torch.Tensor,
+                         origin: torch.Tensor,
+                         theta: torch.Tensor) -> torch.Tensor:
+        cos, sin = theta.cos(), theta.sin()
+        rot = global_xy.new_zeros((global_xy.size(0), 2, 2))
+        rot[:, 0, 0] = cos
+        rot[:, 0, 1] = -sin
+        rot[:, 1, 0] = sin
+        rot[:, 1, 1] = cos
+        centered = global_xy - origin[:, :2].view(-1, 1, 2)
+        return torch.matmul(centered, rot)
 
     def _heads_from_positions(self,
                               loc_pos: torch.Tensor,
