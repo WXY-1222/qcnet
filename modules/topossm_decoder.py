@@ -207,7 +207,7 @@ class TopoSSMDecoder(nn.Module):
         loc_propose_head, conc_propose_head = self._heads_from_positions(loc_propose_pos, scale_propose_pos)
         loc_refine_head, conc_refine_head = self._heads_from_positions(loc_refine_pos, scale_refine_pos)
 
-        return {
+        out = {
             'loc_propose_pos': loc_propose_pos,
             'scale_propose_pos': scale_propose_pos,
             'loc_propose_head': loc_propose_head,
