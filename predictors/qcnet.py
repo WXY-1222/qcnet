@@ -99,6 +99,8 @@ class QCNet(pl.LightningModule):
                  distill_temperature: float = 1.0,
                  distill_warmup_epochs: int = 0,
                  freeze_encoder: bool = False,
+                 use_teacher_proposals: bool = False,
+                 teacher_proposal_source: str = 'refine',
                  eval_k: int = 6,
                  submission_dir: str = './',
                  submission_file_name: str = 'submission',
@@ -160,6 +162,8 @@ class QCNet(pl.LightningModule):
         self.distill_temperature = distill_temperature
         self.distill_warmup_epochs = distill_warmup_epochs
         self.freeze_encoder = freeze_encoder
+        self.use_teacher_proposals = use_teacher_proposals
+        self.teacher_proposal_source = teacher_proposal_source
         self.teacher_model = None
         self.eval_k = eval_k
         self.submission_dir = submission_dir
@@ -253,7 +257,13 @@ class QCNet(pl.LightningModule):
 
     def forward(self, data: HeteroData):
         scene_enc = self.encoder(data)
-        pred = self.decoder(data, scene_enc)
+        proposal_override = self._teacher_proposal_override(data)
+        if proposal_override is not None and self.decoder_type != 'topossm':
+            raise RuntimeError('use_teacher_proposals is only supported with decoder_type=topossm')
+        if proposal_override is not None:
+            pred = self.decoder(data, scene_enc, proposal_override=proposal_override)
+        else:
+            pred = self.decoder(data, scene_enc)
         return pred
 
     def _freeze_except_topo_aux_score(self) -> None:
@@ -263,6 +273,22 @@ class QCNet(pl.LightningModule):
     def _freeze_encoder(self) -> None:
         for param in self.encoder.parameters():
             param.requires_grad_(False)
+
+    def _teacher_proposal_override(self, data: HeteroData):
+        if not self.use_teacher_proposals:
+            return None
+        if self.teacher_model is None:
+            raise RuntimeError('use_teacher_proposals requires --distill_teacher_checkpoint')
+        source_key = {
+            'propose': 'loc_propose_pos',
+            'refine': 'loc_refine_pos',
+        }.get(self.teacher_proposal_source)
+        if source_key is None:
+            raise ValueError(f'{self.teacher_proposal_source} is not a valid teacher_proposal_source')
+        self.teacher_model.eval()
+        with torch.no_grad():
+            teacher_pred = self.teacher_model(data)
+        return {'loc_propose_pos': teacher_pred[source_key]}
 
     def training_step(self,
                       data,
@@ -724,6 +750,8 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--distill_temperature', type=float, default=1.0)
         parser.add_argument('--distill_warmup_epochs', type=int, default=0)
         parser.add_argument('--freeze_encoder', action='store_true')
+        parser.add_argument('--use_teacher_proposals', action='store_true')
+        parser.add_argument('--teacher_proposal_source', type=str, default='refine', choices=['propose', 'refine'])
         parser.add_argument('--eval_k', type=int, default=6)
         parser.add_argument('--submission_dir', type=str, default='./')
         parser.add_argument('--submission_file_name', type=str, default='submission')

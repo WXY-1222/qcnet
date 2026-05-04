@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import Dict, Mapping, Tuple
+from typing import Dict, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -144,7 +144,8 @@ class TopoSSMDecoder(nn.Module):
 
     def forward(self,
                 data: HeteroData,
-                scene_enc: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+                scene_enc: Mapping[str, torch.Tensor],
+                proposal_override: Optional[Mapping[str, torch.Tensor]] = None) -> Dict[str, torch.Tensor]:
         agent_state = scene_enc['x_a'][:, -1]
         mode_state = agent_state.unsqueeze(1) + self.mode_emb.weight.unsqueeze(0)
         mode_state = self.query_mlp(mode_state)
@@ -159,6 +160,11 @@ class TopoSSMDecoder(nn.Module):
         anchor_residual = self.to_anchor_residual(mode_state).view(
             -1, self.num_modes, self.num_future_steps, self.output_dim)
         anchor_local = anchor_base + anchor_residual
+        if proposal_override is not None:
+            anchor_local = proposal_override['loc_propose_pos'][..., :self.output_dim].detach().to(
+                device=anchor_local.device,
+                dtype=anchor_local.dtype,
+            )
 
         corridor_feat, corridor_dist, route_jump = self._extract_corridors(data, scene_enc, anchor_local)
         motion = anchor_local.new_zeros(anchor_local.shape)
