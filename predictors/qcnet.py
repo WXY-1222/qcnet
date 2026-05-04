@@ -252,8 +252,11 @@ class QCNet(pl.LightningModule):
         self.test_predictions = dict()
         if self.topo_aux_score_only:
             self._freeze_except_topo_aux_score()
-        elif self.freeze_encoder:
-            self._freeze_encoder()
+        else:
+            if self.use_teacher_proposals:
+                self._freeze_teacher_overridden_proposal()
+            if self.freeze_encoder:
+                self._freeze_encoder()
 
     def forward(self, data: HeteroData):
         scene_enc = self.encoder(data)
@@ -273,6 +276,13 @@ class QCNet(pl.LightningModule):
     def _freeze_encoder(self) -> None:
         for param in self.encoder.parameters():
             param.requires_grad_(False)
+
+    def _freeze_teacher_overridden_proposal(self) -> None:
+        for module_name in ('to_goal', 'to_anchor_residual', 'to_corridor_goal_delta'):
+            module = getattr(self.decoder, module_name, None)
+            if module is not None:
+                for param in module.parameters():
+                    param.requires_grad_(False)
 
     def _teacher_proposal_override(self, data: HeteroData):
         if not self.use_teacher_proposals:
