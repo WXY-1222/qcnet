@@ -140,6 +140,10 @@ log "run_log=${RUN_LOG}"
   --a2m_radius 80 \
   --decoder_type topossm \
   --topo_proposal_type goal_mlp \
+  --topo_ssm_layers 2 \
+  --topo_mamba_d_state 16 \
+  --topo_mamba_d_conv 4 \
+  --topo_mamba_expand 2 \
   --topo_corridor_loss_weight 0.03 \
   --topo_score_loss_weight 0.06 \
   --topo_score_temperature 0.16 \
