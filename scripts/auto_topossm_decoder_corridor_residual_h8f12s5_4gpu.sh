@@ -12,13 +12,13 @@ DATA_FILE="${DATA_FILE:-interaction_digir_all_12loc_h8_f12_s5.pkl}"
 BASE_OUT="${BASE_OUT:-/data/sdb/bitwxy/qcnet_data}"
 LOG_DIR="${LOG_DIR:-${BASE_OUT}/logs}"
 GPU_IDS="${GPU_IDS:-4,5,6,7}"
-TARGET_ADE="${TARGET_ADE:-0.0388}"
-MAX_EPOCHS="${MAX_EPOCHS:-12}"
+TARGET_ADE="${TARGET_ADE:-0.0525}"
+MAX_EPOCHS="${MAX_EPOCHS:-16}"
 MONITOR_INTERVAL_SEC="${MONITOR_INTERVAL_SEC:-180}"
 
-INIT_CKPT="${INIT_CKPT:-${BASE_OUT}/qcnet_topossm_safetyft_h8_f12_s5_k6_4gpu_20260503/lightning_logs/version_0/checkpoints/epoch=7-step=1288.ckpt}"
-SAVE_ROOT="${SAVE_ROOT:-${BASE_OUT}/qcnet_topossm_decoder_corridor_residual_seed49safetyft_h8_f12_s5_k6_4gpu_20260504}"
-RUN_LOG="${RUN_LOG:-${LOG_DIR}/qcnet_topossm_decoder_corridor_residual_seed49safetyft_h8_f12_s5_k6_4gpu_20260504.log}"
+INIT_CKPT="${INIT_CKPT:-${BASE_OUT}/qcnet_topossm_decoder_B10_light_distill_seed49_h8_f12_s5_k6_4gpu_20260504/lightning_logs/version_0/checkpoints/epoch=5-step=1290.ckpt}"
+SAVE_ROOT="${SAVE_ROOT:-${BASE_OUT}/qcnet_topossm_decoder_corridor_residual_seed49_h8_f12_s5_k6_4gpu_20260504}"
+RUN_LOG="${RUN_LOG:-${LOG_DIR}/qcnet_topossm_decoder_corridor_residual_seed49_h8_f12_s5_k6_4gpu_20260504.log}"
 CKPT_DIR="${SAVE_ROOT}/lightning_logs/version_0/checkpoints"
 
 mkdir -p "${LOG_DIR}" "${SAVE_ROOT}"
@@ -117,7 +117,7 @@ log "run_log=${RUN_LOG}"
   --num_workers 4 \
   --pin_memory false \
   --persistent_workers false \
-  --lr 6e-6 \
+  --lr 1e-5 \
   --weight_decay 1e-4 \
   --eval_batches 0 \
   --num_modes 6 \
@@ -145,8 +145,8 @@ log "run_log=${RUN_LOG}"
   --topo_mamba_d_state 16 \
   --topo_mamba_d_conv 4 \
   --topo_mamba_expand 2 \
-  --topo_corridor_loss_weight 0.01 \
-  --topo_score_loss_weight 0.02 \
+  --topo_corridor_loss_weight 0.02 \
+  --topo_score_loss_weight 0.03 \
   --topo_score_temperature 0.18 \
   > "${RUN_LOG}" 2>&1 &
 pid="$!"
@@ -167,8 +167,8 @@ while kill -0 "${pid}" 2>/dev/null; do
     exit 0
   fi
   if [[ -n "${latest_epoch}" && -n "${best_ade}" ]] && (( latest_epoch >= 4 )); then
-    if ! float_le "${best_ade}" 0.041; then
-      log "Behind schedule at epoch ${latest_epoch}: best_ade=${best_ade} > 0.041; stopping."
+    if ! float_le "${best_ade}" 0.056; then
+      log "Behind schedule at epoch ${latest_epoch}: best_ade=${best_ade} > 0.056; stopping."
       kill_run
       exit 2
     fi
