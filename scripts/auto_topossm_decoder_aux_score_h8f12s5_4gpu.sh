@@ -140,7 +140,8 @@ log "run_log=${RUN_LOG}"
   --topo_score_temperature 0.18 \
   --topo_aux_score \
   --topo_aux_score_only \
-  --topo_aux_score_loss_weight 0.35 \
+  --topo_aux_score_loss_weight 0.10 \
+  --topo_aux_gt_score_loss_weight 1.0 \
   --topo_aux_score_mix 0.05 \
   > "${RUN_LOG}" 2>&1 &
 pid="$!"

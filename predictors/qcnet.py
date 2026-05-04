@@ -89,6 +89,7 @@ class QCNet(pl.LightningModule):
                  topo_aux_score_detach: bool = True,
                  topo_aux_score_only: bool = False,
                  topo_aux_score_loss_weight: float = 0.0,
+                 topo_aux_gt_score_loss_weight: float = 0.0,
                  topo_aux_score_mix: float = 0.0,
                  decoder_type: str = 'qcnet',
                  distill_propose_weight: float = 0.0,
@@ -148,6 +149,7 @@ class QCNet(pl.LightningModule):
         self.topo_aux_score_detach = topo_aux_score_detach
         self.topo_aux_score_only = topo_aux_score_only
         self.topo_aux_score_loss_weight = topo_aux_score_loss_weight
+        self.topo_aux_gt_score_loss_weight = topo_aux_gt_score_loss_weight
         self.topo_aux_score_mix = topo_aux_score_mix
         self.decoder_type = decoder_type
         self.distill_propose_weight = distill_propose_weight
@@ -320,8 +322,25 @@ class QCNet(pl.LightningModule):
         if topo_aux_score_loss is not None:
             self.log('train_topo_aux_score_loss', topo_aux_score_loss, prog_bar=False, on_step=True, on_epoch=True,
                      batch_size=1)
+        topo_aux_gt_score_loss = None
+        if 'topo_aux_pi' in pred:
+            topo_aux_gt_score_loss = F.cross_entropy(pred['topo_aux_pi'], best_mode.detach(), reduction='none')
+            topo_aux_gt_score_loss = (
+                topo_aux_gt_score_loss * cls_mask.to(dtype=topo_aux_gt_score_loss.dtype)
+            ).sum() / cls_mask.sum().clamp_(min=1)
+            self.log('train_topo_aux_gt_score_loss', topo_aux_gt_score_loss, prog_bar=False,
+                     on_step=True, on_epoch=True, batch_size=1)
         for name, loss_value in distill_losses.items():
             self.log(f'train_{name}', loss_value, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+        if self.topo_aux_score_only:
+            if topo_aux_score_loss is None and topo_aux_gt_score_loss is None:
+                raise RuntimeError('topo_aux_score_only requires decoder output topo_aux_pi')
+            aux_loss = 0.0
+            if topo_aux_score_loss is not None:
+                aux_loss = aux_loss + self.topo_aux_score_loss_weight * topo_aux_score_loss
+            if topo_aux_gt_score_loss is not None:
+                aux_loss = aux_loss + self.topo_aux_gt_score_loss_weight * topo_aux_gt_score_loss
+            return aux_loss
         loss = reg_loss_propose + reg_loss_refine + cls_loss
         if topo_corridor_loss is not None:
             loss = loss + self.topo_corridor_loss_weight * topo_corridor_loss
@@ -329,6 +348,8 @@ class QCNet(pl.LightningModule):
             loss = loss + self.topo_score_loss_weight * topo_score_loss
         if topo_aux_score_loss is not None:
             loss = loss + self.topo_aux_score_loss_weight * topo_aux_score_loss
+        if topo_aux_gt_score_loss is not None:
+            loss = loss + self.topo_aux_gt_score_loss_weight * topo_aux_gt_score_loss
         distill_scale = self._distill_scale()
         if distill_losses:
             loss = loss + distill_scale * (
@@ -684,6 +705,7 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--topo_aux_score_detach', type=bool, default=True)
         parser.add_argument('--topo_aux_score_only', action='store_true')
         parser.add_argument('--topo_aux_score_loss_weight', type=float, default=0.0)
+        parser.add_argument('--topo_aux_gt_score_loss_weight', type=float, default=0.0)
         parser.add_argument('--topo_aux_score_mix', type=float, default=0.0)
         parser.add_argument('--decoder_type', type=str, default='qcnet', choices=['qcnet', 'topossm'])
         parser.add_argument('--distill_propose_weight', type=float, default=0.0)
