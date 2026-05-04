@@ -99,7 +99,7 @@ if __name__ == '__main__':
         raise ValueError('Use only one of --init_from_checkpoint and --init_encoder_from_checkpoint')
 
     if args.init_from_checkpoint:
-        model = QCNet.load_from_checkpoint(checkpoint_path=args.init_from_checkpoint, **vars(args))
+        model = QCNet.load_from_checkpoint(checkpoint_path=args.init_from_checkpoint, strict=False, **vars(args))
     else:
         model = QCNet(**vars(args))
         if args.init_encoder_from_checkpoint:

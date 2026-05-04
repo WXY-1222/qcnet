@@ -51,6 +51,8 @@ class TopoSSMDecoder(nn.Module):
                  topo_goal_distance_weight: float = 0.05,
                  topo_goal_residual_scale: float = 0.25,
                  topo_goal_anchor_blend: float = 1.0,
+                 topo_aux_score: bool = False,
+                 topo_aux_score_detach: bool = True,
                  corridor_dist_norm: float = 50.0) -> None:
         super(TopoSSMDecoder, self).__init__()
         self.input_dim = input_dim
@@ -64,6 +66,8 @@ class TopoSSMDecoder(nn.Module):
         self.topo_goal_distance_weight = topo_goal_distance_weight
         self.topo_goal_residual_scale = topo_goal_residual_scale
         self.topo_goal_anchor_blend = topo_goal_anchor_blend
+        self.topo_aux_score = topo_aux_score
+        self.topo_aux_score_detach = topo_aux_score_detach
         self.corridor_dist_norm = corridor_dist_norm
         if topo_proposal_type not in ('goal_mlp', 'corridor_goal'):
             raise ValueError(f'{topo_proposal_type} is not a valid topo_proposal_type')
@@ -117,6 +121,14 @@ class TopoSSMDecoder(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
+        if topo_aux_score:
+            self.to_topo_aux_pi = nn.Sequential(
+                nn.LayerNorm(hidden_dim + 4),
+                nn.Linear(hidden_dim + 4, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 1),
+            )
         self.apply(weight_init)
 
     def forward(self,
@@ -179,6 +191,18 @@ class TopoSSMDecoder(nn.Module):
         score_state = temporal.reshape(n, k, t, self.hidden_dim).mean(dim=2)
         score_topology = torch.stack([corridor_dist.mean(dim=-1), route_jump.mean(dim=-1)], dim=-1)
         pi = self.to_pi(torch.cat([score_state, score_topology], dim=-1)).squeeze(-1)
+        topo_aux_pi = None
+        if self.topo_aux_score:
+            aux_state = score_state.detach() if self.topo_aux_score_detach else score_state
+            aux_corridor_dist = corridor_dist.detach() if self.topo_aux_score_detach else corridor_dist
+            aux_route_jump = route_jump.detach() if self.topo_aux_score_detach else route_jump
+            aux_topology = torch.stack([
+                aux_corridor_dist.mean(dim=-1),
+                aux_corridor_dist.amin(dim=-1),
+                aux_route_jump.mean(dim=-1),
+                aux_route_jump.amax(dim=-1),
+            ], dim=-1)
+            topo_aux_pi = self.to_topo_aux_pi(torch.cat([aux_state, aux_topology], dim=-1)).squeeze(-1)
 
         loc_propose_head, conc_propose_head = self._heads_from_positions(loc_propose_pos, scale_propose_pos)
         loc_refine_head, conc_refine_head = self._heads_from_positions(loc_refine_pos, scale_refine_pos)
@@ -196,6 +220,9 @@ class TopoSSMDecoder(nn.Module):
             'topo_corridor_dist': corridor_dist,
             'topo_route_jump': route_jump,
         }
+        if topo_aux_pi is not None:
+            out['topo_aux_pi'] = topo_aux_pi
+        return out
 
     def _make_goal_anchors(self, goal_local: torch.Tensor) -> torch.Tensor:
         alpha = torch.linspace(

@@ -85,6 +85,11 @@ class QCNet(pl.LightningModule):
                  topo_goal_distance_weight: float = 0.05,
                  topo_goal_residual_scale: float = 0.25,
                  topo_goal_anchor_blend: float = 1.0,
+                 topo_aux_score: bool = False,
+                 topo_aux_score_detach: bool = True,
+                 topo_aux_score_only: bool = False,
+                 topo_aux_score_loss_weight: float = 0.0,
+                 topo_aux_score_mix: float = 0.0,
                  decoder_type: str = 'qcnet',
                  distill_propose_weight: float = 0.0,
                  distill_refine_weight: float = 0.0,
@@ -139,6 +144,11 @@ class QCNet(pl.LightningModule):
         self.topo_goal_distance_weight = topo_goal_distance_weight
         self.topo_goal_residual_scale = topo_goal_residual_scale
         self.topo_goal_anchor_blend = topo_goal_anchor_blend
+        self.topo_aux_score = topo_aux_score
+        self.topo_aux_score_detach = topo_aux_score_detach
+        self.topo_aux_score_only = topo_aux_score_only
+        self.topo_aux_score_loss_weight = topo_aux_score_loss_weight
+        self.topo_aux_score_mix = topo_aux_score_mix
         self.decoder_type = decoder_type
         self.distill_propose_weight = distill_propose_weight
         self.distill_refine_weight = distill_refine_weight
@@ -213,6 +223,8 @@ class QCNet(pl.LightningModule):
                 topo_goal_distance_weight=topo_goal_distance_weight,
                 topo_goal_residual_scale=topo_goal_residual_scale,
                 topo_goal_anchor_blend=topo_goal_anchor_blend,
+                topo_aux_score=topo_aux_score,
+                topo_aux_score_detach=topo_aux_score_detach,
             )
         else:
             raise ValueError(f'{decoder_type} is not a valid decoder_type')
@@ -230,11 +242,17 @@ class QCNet(pl.LightningModule):
         self.MR = MR(max_guesses=eval_k)
 
         self.test_predictions = dict()
+        if self.topo_aux_score_only:
+            self._freeze_except_topo_aux_score()
 
     def forward(self, data: HeteroData):
         scene_enc = self.encoder(data)
         pred = self.decoder(data, scene_enc)
         return pred
+
+    def _freeze_except_topo_aux_score(self) -> None:
+        for name, param in self.named_parameters():
+            param.requires_grad_(name.startswith('decoder.to_topo_aux_pi.'))
 
     def training_step(self,
                       data,
@@ -278,7 +296,7 @@ class QCNet(pl.LightningModule):
                                  prob=pi,
                                  mask=reg_mask[:, -1:]) * cls_mask
         cls_loss = cls_loss.sum() / cls_mask.sum().clamp_(min=1)
-        topo_corridor_loss, topo_score_loss = self._topology_aux_losses(
+        topo_corridor_loss, topo_score_loss, topo_aux_score_loss = self._topology_aux_losses(
             pred=pred,
             pi=pi,
             best_mode=best_mode,
@@ -299,6 +317,9 @@ class QCNet(pl.LightningModule):
         if topo_score_loss is not None:
             self.log('train_topo_score_loss', topo_score_loss, prog_bar=False, on_step=True, on_epoch=True,
                      batch_size=1)
+        if topo_aux_score_loss is not None:
+            self.log('train_topo_aux_score_loss', topo_aux_score_loss, prog_bar=False, on_step=True, on_epoch=True,
+                     batch_size=1)
         for name, loss_value in distill_losses.items():
             self.log(f'train_{name}', loss_value, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         loss = reg_loss_propose + reg_loss_refine + cls_loss
@@ -306,6 +327,8 @@ class QCNet(pl.LightningModule):
             loss = loss + self.topo_corridor_loss_weight * topo_corridor_loss
         if topo_score_loss is not None:
             loss = loss + self.topo_score_loss_weight * topo_score_loss
+        if topo_aux_score_loss is not None:
+            loss = loss + self.topo_aux_score_loss_weight * topo_aux_score_loss
         distill_scale = self._distill_scale()
         if distill_losses:
             loss = loss + distill_scale * (
@@ -357,7 +380,7 @@ class QCNet(pl.LightningModule):
                                  prob=pi,
                                  mask=reg_mask[:, -1:]) * cls_mask
         cls_loss = cls_loss.sum() / cls_mask.sum().clamp_(min=1)
-        topo_corridor_loss, topo_score_loss = self._topology_aux_losses(
+        topo_corridor_loss, topo_score_loss, topo_aux_score_loss = self._topology_aux_losses(
             pred=pred,
             pi=pi,
             best_mode=best_mode,
@@ -374,6 +397,9 @@ class QCNet(pl.LightningModule):
         if topo_score_loss is not None:
             self.log('val_topo_score_loss', topo_score_loss, prog_bar=False, on_step=False, on_epoch=True,
                      batch_size=1, sync_dist=True)
+        if topo_aux_score_loss is not None:
+            self.log('val_topo_aux_score_loss', topo_aux_score_loss, prog_bar=False, on_step=False, on_epoch=True,
+                     batch_size=1, sync_dist=True)
 
         if self.dataset in ('argoverse_v2', 'interaction_digir'):
             eval_mask = data['agent']['category'] == 3
@@ -387,7 +413,7 @@ class QCNet(pl.LightningModule):
             motion_vector_eval = traj_2d_with_start_pos_eval[:, :, 1:] - traj_2d_with_start_pos_eval[:, :, :-1]
             head_eval = torch.atan2(motion_vector_eval[..., 1], motion_vector_eval[..., 0])
             traj_eval = torch.cat([traj_eval, head_eval.unsqueeze(-1)], dim=-1)
-        pi_eval = F.softmax(pi[eval_mask], dim=-1)
+        pi_eval = F.softmax(self._eval_pi_logits(pred, pi)[eval_mask], dim=-1)
         gt_eval = gt[eval_mask]
 
         self.Brier.update(pred=traj_eval[..., :self.output_dim], target=gt_eval[..., :self.output_dim], prob=pi_eval,
@@ -421,7 +447,7 @@ class QCNet(pl.LightningModule):
         else:
             traj_refine = torch.cat([pred['loc_refine_pos'][..., :self.output_dim],
                                      pred['scale_refine_pos'][..., :self.output_dim]], dim=-1)
-        pi = pred['pi']
+        pi = self._eval_pi_logits(pred, pred['pi'])
         if self.dataset in ('argoverse_v2', 'interaction_digir'):
             eval_mask = data['agent']['category'] == 3
         else:
@@ -513,7 +539,7 @@ class QCNet(pl.LightningModule):
                              reg_mask: torch.Tensor,
                              cls_mask: torch.Tensor):
         if 'topo_corridor_dist' not in pred:
-            return None, None
+            return None, None, None
         corridor_dist = pred['topo_corridor_dist']
         batch_idx = torch.arange(corridor_dist.size(0), device=corridor_dist.device)
         mode_dist = corridor_dist[batch_idx, best_mode]
@@ -526,7 +552,21 @@ class QCNet(pl.LightningModule):
         target = F.softmax(-mode_mean_dist / max(float(self.topo_score_temperature), 1e-4), dim=-1).detach()
         score_loss = F.kl_div(F.log_softmax(pi, dim=-1), target, reduction='none').sum(dim=-1)
         score_loss = (score_loss * cls_mask.to(dtype=score_loss.dtype)).sum() / cls_mask.sum().clamp_(min=1)
-        return corridor_loss, score_loss
+        aux_score_loss = None
+        if 'topo_aux_pi' in pred:
+            aux_score_loss = F.kl_div(
+                F.log_softmax(pred['topo_aux_pi'], dim=-1),
+                target,
+                reduction='none').sum(dim=-1)
+            aux_score_loss = (
+                aux_score_loss * cls_mask.to(dtype=aux_score_loss.dtype)).sum() / cls_mask.sum().clamp_(min=1)
+        return corridor_loss, score_loss, aux_score_loss
+
+    def _eval_pi_logits(self, pred, pi: torch.Tensor) -> torch.Tensor:
+        mix = max(0.0, min(float(self.topo_aux_score_mix), 1.0))
+        if mix <= 0.0 or 'topo_aux_pi' not in pred:
+            return pi
+        return (1.0 - mix) * pi + mix * pred['topo_aux_pi']
 
     def _distill_scale(self) -> float:
         if self.distill_warmup_epochs <= 0:
@@ -640,6 +680,11 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--topo_goal_distance_weight', type=float, default=0.05)
         parser.add_argument('--topo_goal_residual_scale', type=float, default=0.25)
         parser.add_argument('--topo_goal_anchor_blend', type=float, default=1.0)
+        parser.add_argument('--topo_aux_score', action='store_true')
+        parser.add_argument('--topo_aux_score_detach', type=bool, default=True)
+        parser.add_argument('--topo_aux_score_only', action='store_true')
+        parser.add_argument('--topo_aux_score_loss_weight', type=float, default=0.0)
+        parser.add_argument('--topo_aux_score_mix', type=float, default=0.0)
         parser.add_argument('--decoder_type', type=str, default='qcnet', choices=['qcnet', 'topossm'])
         parser.add_argument('--distill_propose_weight', type=float, default=0.0)
         parser.add_argument('--distill_refine_weight', type=float, default=0.0)
