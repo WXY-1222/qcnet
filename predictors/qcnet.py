@@ -697,7 +697,8 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--topo_corridor_loss_weight', type=float, default=0.0)
         parser.add_argument('--topo_score_loss_weight', type=float, default=0.0)
         parser.add_argument('--topo_score_temperature', type=float, default=0.2)
-        parser.add_argument('--topo_proposal_type', type=str, default='goal_mlp', choices=['goal_mlp', 'corridor_goal'])
+        parser.add_argument('--topo_proposal_type', type=str, default='goal_mlp',
+                            choices=['goal_mlp', 'corridor_goal', 'corridor_residual'])
         parser.add_argument('--topo_goal_distance_weight', type=float, default=0.05)
         parser.add_argument('--topo_goal_residual_scale', type=float, default=0.25)
         parser.add_argument('--topo_goal_anchor_blend', type=float, default=1.0)
