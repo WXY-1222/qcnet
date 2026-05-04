@@ -89,6 +89,7 @@ class QCNet(pl.LightningModule):
                  distill_propose_weight: float = 0.0,
                  distill_refine_weight: float = 0.0,
                  distill_score_weight: float = 0.0,
+                 distill_rank_weight: float = 0.0,
                  distill_temperature: float = 1.0,
                  distill_warmup_epochs: int = 0,
                  eval_k: int = 6,
@@ -142,6 +143,7 @@ class QCNet(pl.LightningModule):
         self.distill_propose_weight = distill_propose_weight
         self.distill_refine_weight = distill_refine_weight
         self.distill_score_weight = distill_score_weight
+        self.distill_rank_weight = distill_rank_weight
         self.distill_temperature = distill_temperature
         self.distill_warmup_epochs = distill_warmup_epochs
         self.teacher_model = None
@@ -309,7 +311,8 @@ class QCNet(pl.LightningModule):
             loss = loss + distill_scale * (
                 self.distill_propose_weight * distill_losses.get('distill_propose_loss', 0.0) +
                 self.distill_refine_weight * distill_losses.get('distill_refine_loss', 0.0) +
-                self.distill_score_weight * distill_losses.get('distill_score_loss', 0.0))
+                self.distill_score_weight * distill_losses.get('distill_score_loss', 0.0) +
+                self.distill_rank_weight * distill_losses.get('distill_rank_loss', 0.0))
         return loss
 
     def validation_step(self,
@@ -538,7 +541,8 @@ class QCNet(pl.LightningModule):
                                 cls_mask: torch.Tensor):
         if self.teacher_model is None:
             return {}
-        if self.distill_propose_weight <= 0.0 and self.distill_refine_weight <= 0.0 and self.distill_score_weight <= 0.0:
+        if (self.distill_propose_weight <= 0.0 and self.distill_refine_weight <= 0.0 and
+                self.distill_score_weight <= 0.0 and self.distill_rank_weight <= 0.0):
             return {}
 
         self.teacher_model.eval()
@@ -569,7 +573,7 @@ class QCNet(pl.LightningModule):
             propose_loss, _, _ = matched_traj_loss(pred['loc_propose_pos'], teacher_pred['loc_propose_pos'])
             losses['distill_propose_loss'] = propose_loss
 
-        if self.distill_refine_weight > 0.0 or self.distill_score_weight > 0.0:
+        if self.distill_refine_weight > 0.0 or self.distill_score_weight > 0.0 or self.distill_rank_weight > 0.0:
             refine_loss, assigned_student, teacher_prob = matched_traj_loss(
                 pred['loc_refine_pos'], teacher_pred['loc_refine_pos'])
             if self.distill_refine_weight > 0.0:
@@ -584,6 +588,12 @@ class QCNet(pl.LightningModule):
                     reduction='none').sum(dim=-1) * (temperature ** 2)
                 score_loss = (score_loss * cls_weight).sum() / cls_den
                 losses['distill_score_loss'] = score_loss
+            if self.distill_rank_weight > 0.0:
+                teacher_top = teacher_prob.argmax(dim=-1, keepdim=True)
+                target_student = assigned_student.gather(dim=1, index=teacher_top).squeeze(1).detach()
+                rank_loss = F.cross_entropy(pi, target_student, reduction='none')
+                rank_loss = (rank_loss * cls_weight).sum() / cls_den
+                losses['distill_rank_loss'] = rank_loss
         return losses
 
     @staticmethod
@@ -634,6 +644,7 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--distill_propose_weight', type=float, default=0.0)
         parser.add_argument('--distill_refine_weight', type=float, default=0.0)
         parser.add_argument('--distill_score_weight', type=float, default=0.0)
+        parser.add_argument('--distill_rank_weight', type=float, default=0.0)
         parser.add_argument('--distill_temperature', type=float, default=1.0)
         parser.add_argument('--distill_warmup_epochs', type=int, default=0)
         parser.add_argument('--eval_k', type=int, default=6)
