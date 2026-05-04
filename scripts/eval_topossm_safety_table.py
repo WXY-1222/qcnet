@@ -161,6 +161,8 @@ def update_group(
     mr_best,
     ade_top1,
     fde_top1,
+    brier_fde_best,
+    top1_prob,
     corridor_best,
     corridor_top1,
     offroad_best,
@@ -178,6 +180,8 @@ def update_group(
     add_mean(bucket, "MR", mr_best)
     add_mean(bucket, "top1_ADE", ade_top1)
     add_mean(bucket, "top1_FDE", fde_top1)
+    add_mean(bucket, "brier_FDE_best", brier_fde_best)
+    add_mean(bucket, "top1_prob", top1_prob)
     add_rate(bucket, "corridor_dist_best", corridor_best * valid_mask, valid_mask)
     add_rate(bucket, "corridor_dist_top1", corridor_top1 * valid_mask, valid_mask)
     add_rate(bucket, "offroad_best", offroad_best & valid_mask, valid_mask)
@@ -203,7 +207,8 @@ def evaluate_model(args, name: str, ckpt_path: str, loader: DataLoader, device: 
         reg_mask = batch["agent"]["predict_mask"][:, model.num_historical_steps:][eval_mask]
         local_gt = batch["agent"]["target"][eval_mask, :, :2]
         local_pred = pred["loc_refine_pos"][eval_mask, :, :, :2]
-        prob = F.softmax(pred["pi"][eval_mask], dim=-1)
+        pi_logits = model._eval_pi_logits(pred, pred["pi"]) if hasattr(model, "_eval_pi_logits") else pred["pi"]
+        prob = F.softmax(pi_logits[eval_mask], dim=-1)
         top_idx = prob.argmax(dim=-1)
         n, k, t, _ = local_pred.shape
         valid_counts = reg_mask.sum(dim=-1).clamp(min=1)
@@ -215,6 +220,9 @@ def evaluate_model(args, name: str, ckpt_path: str, loader: DataLoader, device: 
             dim=-1,
         )
         best_idx = fde_modes.argmin(dim=-1)
+        best_prob = prob[torch.arange(n, device=device), best_idx]
+        brier_fde_best = (1.0 - best_prob).pow(2)
+        top1_prob = prob[torch.arange(n, device=device), top_idx]
         pred_best = local_pred[torch.arange(n, device=device), best_idx]
         pred_top1 = local_pred[torch.arange(n, device=device), top_idx]
         ade_best = (torch.norm(pred_best - local_gt, dim=-1) * reg_mask).sum(dim=-1) / valid_counts
@@ -268,6 +276,7 @@ def evaluate_model(args, name: str, ckpt_path: str, loader: DataLoader, device: 
                     bucket,
                     ade_best[agent_sel], fde_best[agent_sel], mr_best[agent_sel],
                     ade_top1[agent_sel], fde_top1[agent_sel],
+                    brier_fde_best[agent_sel], top1_prob[agent_sel],
                     best_stats["corridor_dist"], top1_stats["corridor_dist"],
                     best_stats["offroad"], top1_stats["offroad"],
                     best_stats["route_jump"], top1_stats["route_jump"],
