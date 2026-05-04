@@ -69,7 +69,7 @@ class TopoSSMDecoder(nn.Module):
         self.topo_aux_score = topo_aux_score
         self.topo_aux_score_detach = topo_aux_score_detach
         self.corridor_dist_norm = corridor_dist_norm
-        if topo_proposal_type not in ('goal_mlp', 'corridor_goal', 'corridor_residual'):
+        if topo_proposal_type not in ('goal_mlp', 'corridor_goal', 'corridor_residual', 'corridor_query'):
             raise ValueError(f'{topo_proposal_type} is not a valid topo_proposal_type')
 
         self.mode_emb = nn.Embedding(num_modes, hidden_dim)
@@ -81,13 +81,21 @@ class TopoSSMDecoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.to_goal = MLPLayer(input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=output_dim)
-        if topo_proposal_type == 'corridor_residual':
+        if topo_proposal_type in ('corridor_residual', 'corridor_query'):
             self.to_corridor_goal_delta = nn.Sequential(
                 nn.LayerNorm(hidden_dim * 2 + output_dim),
                 nn.Linear(hidden_dim * 2 + output_dim, hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_dim, output_dim),
+            )
+        if topo_proposal_type == 'corridor_query':
+            self.to_corridor_anchor_delta = nn.Sequential(
+                nn.LayerNorm(hidden_dim * 2 + output_dim + 2),
+                nn.Linear(hidden_dim * 2 + output_dim + 2, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, num_future_steps * output_dim),
             )
         self.to_anchor_residual = MLPLayer(
             input_dim=hidden_dim,
@@ -138,9 +146,12 @@ class TopoSSMDecoder(nn.Module):
                 nn.Linear(hidden_dim, 1),
             )
         self.apply(weight_init)
-        if topo_proposal_type == 'corridor_residual':
+        if topo_proposal_type in ('corridor_residual', 'corridor_query'):
             nn.init.zeros_(self.to_corridor_goal_delta[-1].weight)
             nn.init.zeros_(self.to_corridor_goal_delta[-1].bias)
+        if topo_proposal_type == 'corridor_query':
+            nn.init.zeros_(self.to_corridor_anchor_delta[-1].weight)
+            nn.init.zeros_(self.to_corridor_anchor_delta[-1].bias)
 
     def forward(self,
                 data: HeteroData,
@@ -150,16 +161,26 @@ class TopoSSMDecoder(nn.Module):
         mode_state = agent_state.unsqueeze(1) + self.mode_emb.weight.unsqueeze(0)
         mode_state = self.query_mlp(mode_state)
 
-        if self.topo_proposal_type == 'corridor_goal':
+        if self.topo_proposal_type == 'corridor_query':
+            goal_local, anchor_local = self._make_corridor_query_proposals(data, scene_enc, mode_state)
+        elif self.topo_proposal_type == 'corridor_goal':
             goal_local = self._make_corridor_goals(data, scene_enc, mode_state)
+            anchor_base = self._make_goal_anchors(goal_local)
+            anchor_residual = self.to_anchor_residual(mode_state).view(
+                -1, self.num_modes, self.num_future_steps, self.output_dim)
+            anchor_local = anchor_base + anchor_residual
         elif self.topo_proposal_type == 'corridor_residual':
             goal_local = self._make_corridor_residual_goals(data, scene_enc, mode_state)
+            anchor_base = self._make_goal_anchors(goal_local)
+            anchor_residual = self.to_anchor_residual(mode_state).view(
+                -1, self.num_modes, self.num_future_steps, self.output_dim)
+            anchor_local = anchor_base + anchor_residual
         else:
             goal_local = self.to_goal(mode_state)
-        anchor_base = self._make_goal_anchors(goal_local)
-        anchor_residual = self.to_anchor_residual(mode_state).view(
-            -1, self.num_modes, self.num_future_steps, self.output_dim)
-        anchor_local = anchor_base + anchor_residual
+            anchor_base = self._make_goal_anchors(goal_local)
+            anchor_residual = self.to_anchor_residual(mode_state).view(
+                -1, self.num_modes, self.num_future_steps, self.output_dim)
+            anchor_local = anchor_base + anchor_residual
         if proposal_override is not None:
             anchor_local = proposal_override['loc_propose_pos'][..., :self.output_dim].detach().to(
                 device=anchor_local.device,
@@ -344,6 +365,111 @@ class TopoSSMDecoder(nn.Module):
                 map_feat,
             )
         return goal_local
+
+    def _make_corridor_query_proposals(self,
+                                       data: HeteroData,
+                                       scene_enc: Mapping[str, torch.Tensor],
+                                       mode_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = mode_state.device
+        dtype = mode_state.dtype
+        fallback_goal = self.to_goal(mode_state)
+        fallback_anchor = self._make_goal_anchors(fallback_goal) + self.to_anchor_residual(mode_state).view(
+            -1, self.num_modes, self.num_future_steps, self.output_dim)
+
+        map_pos = data['map_polygon']['position'][:, :2].to(device=device, dtype=dtype)
+        if map_pos.numel() == 0:
+            return fallback_goal, fallback_anchor
+
+        map_feat = scene_enc['x_pl'][:, -1].to(device=device, dtype=dtype)
+        agent_origin = data['agent']['position'][:, self.num_historical_steps - 1].to(device=device, dtype=dtype)
+        agent_heading = data['agent']['heading'][:, self.num_historical_steps - 1].to(device=device, dtype=dtype)
+        goal_local = fallback_goal.new_empty(fallback_goal.shape)
+        anchor_local = fallback_anchor.new_empty(fallback_anchor.shape)
+
+        if isinstance(data, Batch):
+            agent_batch = data['agent']['batch'].to(device=device)
+            map_batch = data['map_polygon']['batch'].to(device=device)
+            for batch_id in torch.unique(agent_batch, sorted=True):
+                agent_idx = torch.nonzero(agent_batch == batch_id, as_tuple=False).flatten()
+                map_idx = torch.nonzero(map_batch == batch_id, as_tuple=False).flatten()
+                if agent_idx.numel() == 0:
+                    continue
+                if map_idx.numel() == 0:
+                    goal_local[agent_idx] = fallback_goal[agent_idx]
+                    anchor_local[agent_idx] = fallback_anchor[agent_idx]
+                    continue
+                goal_part, anchor_part = self._select_corridor_query_for_agents(
+                    mode_state[agent_idx],
+                    fallback_goal[agent_idx],
+                    fallback_anchor[agent_idx],
+                    agent_origin[agent_idx],
+                    agent_heading[agent_idx],
+                    map_pos[map_idx],
+                    map_feat[map_idx],
+                )
+                goal_local[agent_idx] = goal_part
+                anchor_local[agent_idx] = anchor_part
+        else:
+            goal_local, anchor_local = self._select_corridor_query_for_agents(
+                mode_state,
+                fallback_goal,
+                fallback_anchor,
+                agent_origin,
+                agent_heading,
+                map_pos,
+                map_feat,
+            )
+        return goal_local, anchor_local
+
+    def _select_corridor_query_for_agents(self,
+                                          mode_state: torch.Tensor,
+                                          fallback_goal: torch.Tensor,
+                                          fallback_anchor: torch.Tensor,
+                                          agent_origin: torch.Tensor,
+                                          agent_heading: torch.Tensor,
+                                          map_pos: torch.Tensor,
+                                          map_feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        query_score = torch.einsum('nkh,mh->nkm', mode_state, map_feat) / math.sqrt(self.hidden_dim)
+        fallback_global = self._local_to_global(
+            fallback_goal.unsqueeze(2),
+            agent_origin[:, :2],
+            agent_heading,
+        ).squeeze(2)
+        distance = torch.cdist(fallback_global.reshape(-1, self.output_dim), map_pos).reshape(
+            mode_state.size(0), self.num_modes, -1)
+        score = query_score - self.topo_goal_distance_weight * distance / self.corridor_dist_norm
+        selected = score.argmax(dim=-1)
+        selected_global = map_pos[selected]
+        selected_local = self._global_to_local(selected_global, agent_origin[:, :2], agent_heading)
+        selected_feat = map_feat[selected]
+        corridor_offset = selected_local - fallback_goal
+
+        goal_delta_input = torch.cat([mode_state, selected_feat, corridor_offset], dim=-1)
+        goal_delta = self.topo_goal_residual_scale * torch.tanh(self.to_corridor_goal_delta(goal_delta_input))
+        corridor_goal = selected_local + goal_delta
+
+        distance_norm = corridor_offset.norm(dim=-1, keepdim=True) / self.corridor_dist_norm
+        mode_progress = torch.linspace(
+            0.0,
+            1.0,
+            self.num_modes,
+            device=mode_state.device,
+            dtype=mode_state.dtype,
+        ).view(1, self.num_modes, 1).expand(mode_state.size(0), -1, -1)
+        anchor_delta_input = torch.cat([mode_state, selected_feat, corridor_offset, distance_norm, mode_progress], dim=-1)
+        anchor_delta = self.topo_goal_residual_scale * torch.tanh(
+            self.to_corridor_anchor_delta(anchor_delta_input).view(
+                mode_state.size(0),
+                self.num_modes,
+                self.num_future_steps,
+                self.output_dim,
+            )
+        )
+        corridor_anchor = self._make_goal_anchors(corridor_goal) + anchor_delta
+        blend = max(0.0, min(float(self.topo_goal_anchor_blend), 1.0))
+        goal_local = fallback_goal + blend * (corridor_goal - fallback_goal)
+        anchor_local = fallback_anchor + blend * (corridor_anchor - fallback_anchor)
+        return goal_local, anchor_local
 
     def _select_corridor_residual_goals_for_agents(self,
                                                    mode_state: torch.Tensor,
