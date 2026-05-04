@@ -98,6 +98,7 @@ class QCNet(pl.LightningModule):
                  distill_rank_weight: float = 0.0,
                  distill_temperature: float = 1.0,
                  distill_warmup_epochs: int = 0,
+                 freeze_encoder: bool = False,
                  eval_k: int = 6,
                  submission_dir: str = './',
                  submission_file_name: str = 'submission',
@@ -158,6 +159,7 @@ class QCNet(pl.LightningModule):
         self.distill_rank_weight = distill_rank_weight
         self.distill_temperature = distill_temperature
         self.distill_warmup_epochs = distill_warmup_epochs
+        self.freeze_encoder = freeze_encoder
         self.teacher_model = None
         self.eval_k = eval_k
         self.submission_dir = submission_dir
@@ -246,6 +248,8 @@ class QCNet(pl.LightningModule):
         self.test_predictions = dict()
         if self.topo_aux_score_only:
             self._freeze_except_topo_aux_score()
+        elif self.freeze_encoder:
+            self._freeze_encoder()
 
     def forward(self, data: HeteroData):
         scene_enc = self.encoder(data)
@@ -255,6 +259,10 @@ class QCNet(pl.LightningModule):
     def _freeze_except_topo_aux_score(self) -> None:
         for name, param in self.named_parameters():
             param.requires_grad_(name.startswith('decoder.to_topo_aux_pi.'))
+
+    def _freeze_encoder(self) -> None:
+        for param in self.encoder.parameters():
+            param.requires_grad_(False)
 
     def training_step(self,
                       data,
@@ -715,6 +723,7 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--distill_rank_weight', type=float, default=0.0)
         parser.add_argument('--distill_temperature', type=float, default=1.0)
         parser.add_argument('--distill_warmup_epochs', type=int, default=0)
+        parser.add_argument('--freeze_encoder', action='store_true')
         parser.add_argument('--eval_k', type=int, default=6)
         parser.add_argument('--submission_dir', type=str, default='./')
         parser.add_argument('--submission_file_name', type=str, default='submission')
