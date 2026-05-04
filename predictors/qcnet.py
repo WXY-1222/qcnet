@@ -384,6 +384,11 @@ class QCNet(pl.LightningModule):
                 aux_loss = aux_loss + self.topo_aux_score_loss_weight * topo_aux_score_loss
             if topo_aux_gt_score_loss is not None:
                 aux_loss = aux_loss + self.topo_aux_gt_score_loss_weight * topo_aux_gt_score_loss
+            distill_scale = self._distill_scale()
+            if distill_losses:
+                aux_loss = aux_loss + distill_scale * (
+                    self.distill_score_weight * distill_losses.get('distill_score_loss', 0.0) +
+                    self.distill_rank_weight * distill_losses.get('distill_rank_loss', 0.0))
             return aux_loss
         loss = reg_loss_propose + reg_loss_refine + cls_loss
         if topo_corridor_loss is not None:
@@ -681,6 +686,7 @@ class QCNet(pl.LightningModule):
         if self.distill_refine_weight > 0.0 or self.distill_score_weight > 0.0 or self.distill_rank_weight > 0.0:
             refine_loss, assigned_student, teacher_prob = matched_traj_loss(
                 pred['loc_refine_pos'], teacher_pred['loc_refine_pos'])
+            score_logits = pred.get('topo_aux_pi', pi) if self.topo_aux_score_only else pi
             if self.distill_refine_weight > 0.0:
                 losses['distill_refine_loss'] = refine_loss
             if self.distill_score_weight > 0.0:
@@ -688,7 +694,7 @@ class QCNet(pl.LightningModule):
                 target_prob.scatter_add_(dim=1, index=assigned_student, src=teacher_prob)
                 target_prob = target_prob / target_prob.sum(dim=-1, keepdim=True).clamp(min=1e-6)
                 score_loss = F.kl_div(
-                    F.log_softmax(pi / temperature, dim=-1),
+                    F.log_softmax(score_logits / temperature, dim=-1),
                     target_prob.detach(),
                     reduction='none').sum(dim=-1) * (temperature ** 2)
                 score_loss = (score_loss * cls_weight).sum() / cls_den
@@ -696,7 +702,7 @@ class QCNet(pl.LightningModule):
             if self.distill_rank_weight > 0.0:
                 teacher_top = teacher_prob.argmax(dim=-1, keepdim=True)
                 target_student = assigned_student.gather(dim=1, index=teacher_top).squeeze(1).detach()
-                rank_loss = F.cross_entropy(pi, target_student, reduction='none')
+                rank_loss = F.cross_entropy(score_logits, target_student, reduction='none')
                 rank_loss = (rank_loss * cls_weight).sum() / cls_den
                 losses['distill_rank_loss'] = rank_loss
         return losses
