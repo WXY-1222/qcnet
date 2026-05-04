@@ -527,7 +527,8 @@ class TopoSSMDecoder(nn.Module):
         )
         blend = max(0.0, min(float(self.topo_goal_anchor_blend), 1.0))
         goal_local = fallback_goal + blend * goal_delta
-        anchor_local = fallback_anchor + blend * anchor_delta
+        goal_path_delta = self._make_goal_anchors(blend * goal_delta)
+        anchor_local = fallback_anchor + goal_path_delta + blend * anchor_delta
         return goal_local, anchor_local
 
     def _select_corridor_query_for_agents(self,
