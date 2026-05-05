@@ -51,6 +51,7 @@ class TopoSSMDecoder(nn.Module):
                  topo_goal_distance_weight: float = 0.05,
                  topo_goal_residual_scale: float = 0.25,
                  topo_goal_anchor_blend: float = 1.0,
+                 topo_mode_endpoint_scale: float = 0.08,
                  topo_aux_score: bool = False,
                  topo_aux_score_detach: bool = True,
                  corridor_dist_norm: float = 50.0) -> None:
@@ -66,11 +67,13 @@ class TopoSSMDecoder(nn.Module):
         self.topo_goal_distance_weight = topo_goal_distance_weight
         self.topo_goal_residual_scale = topo_goal_residual_scale
         self.topo_goal_anchor_blend = topo_goal_anchor_blend
+        self.topo_mode_endpoint_scale = topo_mode_endpoint_scale
         self.topo_aux_score = topo_aux_score
         self.topo_aux_score_detach = topo_aux_score_detach
         self.corridor_dist_norm = corridor_dist_norm
         if topo_proposal_type not in (
-                'goal_mlp', 'corridor_goal', 'corridor_residual', 'corridor_query', 'corridor_query_safe'):
+                'goal_mlp', 'mode_endpoint', 'corridor_goal', 'corridor_residual', 'corridor_query',
+                'corridor_query_safe'):
             raise ValueError(f'{topo_proposal_type} is not a valid topo_proposal_type')
 
         self.mode_emb = nn.Embedding(num_modes, hidden_dim)
@@ -82,6 +85,15 @@ class TopoSSMDecoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.to_goal = MLPLayer(input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=output_dim)
+        if topo_proposal_type == 'mode_endpoint':
+            self.mode_endpoint_anchor = nn.Parameter(torch.zeros(num_modes, output_dim))
+            self.to_mode_endpoint_delta = nn.Sequential(
+                nn.LayerNorm(hidden_dim * 2 + output_dim * 2),
+                nn.Linear(hidden_dim * 2 + output_dim * 2, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+            )
         if topo_proposal_type in ('corridor_residual', 'corridor_query', 'corridor_query_safe'):
             self.to_corridor_goal_delta = nn.Sequential(
                 nn.LayerNorm(hidden_dim * 2 + output_dim),
@@ -147,6 +159,10 @@ class TopoSSMDecoder(nn.Module):
                 nn.Linear(hidden_dim, 1),
             )
         self.apply(weight_init)
+        if topo_proposal_type == 'mode_endpoint':
+            self._init_mode_endpoint_anchor()
+            nn.init.zeros_(self.to_mode_endpoint_delta[-1].weight)
+            nn.init.zeros_(self.to_mode_endpoint_delta[-1].bias)
         if topo_proposal_type in ('corridor_residual', 'corridor_query', 'corridor_query_safe'):
             nn.init.zeros_(self.to_corridor_goal_delta[-1].weight)
             nn.init.zeros_(self.to_corridor_goal_delta[-1].bias)
@@ -174,6 +190,12 @@ class TopoSSMDecoder(nn.Module):
             anchor_local = anchor_base + anchor_residual
         elif self.topo_proposal_type == 'corridor_residual':
             goal_local = self._make_corridor_residual_goals(data, scene_enc, mode_state)
+            anchor_base = self._make_goal_anchors(goal_local)
+            anchor_residual = self.to_anchor_residual(mode_state).view(
+                -1, self.num_modes, self.num_future_steps, self.output_dim)
+            anchor_local = anchor_base + anchor_residual
+        elif self.topo_proposal_type == 'mode_endpoint':
+            goal_local = self._make_mode_endpoint_goals(agent_state, mode_state)
             anchor_base = self._make_goal_anchors(goal_local)
             anchor_residual = self.to_anchor_residual(mode_state).view(
                 -1, self.num_modes, self.num_future_steps, self.output_dim)
@@ -276,6 +298,25 @@ class TopoSSMDecoder(nn.Module):
             dtype=goal_local.dtype,
         )
         return goal_local.unsqueeze(2) * alpha.view(1, 1, self.num_future_steps, 1)
+
+    def _init_mode_endpoint_anchor(self) -> None:
+        with torch.no_grad():
+            progress = torch.linspace(-1.0, 1.0, self.num_modes, dtype=self.mode_endpoint_anchor.dtype)
+            self.mode_endpoint_anchor.zero_()
+            self.mode_endpoint_anchor[:, 0] = 0.5 * progress
+            if self.output_dim > 1:
+                self.mode_endpoint_anchor[:, 1] = progress
+
+    def _make_mode_endpoint_goals(self,
+                                  agent_state: torch.Tensor,
+                                  mode_state: torch.Tensor) -> torch.Tensor:
+        fallback_goal = self.to_goal(mode_state)
+        agent_tokens = agent_state.unsqueeze(1).expand(-1, self.num_modes, -1)
+        mode_anchor = self.mode_endpoint_anchor.unsqueeze(0).expand(mode_state.size(0), -1, -1)
+        delta_input = torch.cat([mode_state, agent_tokens, fallback_goal, mode_anchor], dim=-1)
+        endpoint_delta = mode_anchor + self.to_mode_endpoint_delta(delta_input)
+        endpoint_delta = self.topo_mode_endpoint_scale * torch.tanh(endpoint_delta)
+        return fallback_goal + endpoint_delta
 
     def _make_corridor_goals(self,
                              data: HeteroData,

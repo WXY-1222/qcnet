@@ -85,6 +85,7 @@ class QCNet(pl.LightningModule):
                  topo_goal_distance_weight: float = 0.05,
                  topo_goal_residual_scale: float = 0.25,
                  topo_goal_anchor_blend: float = 1.0,
+                 topo_mode_endpoint_scale: float = 0.08,
                  topo_aux_score: bool = False,
                  topo_aux_score_detach: bool = True,
                  topo_aux_score_only: bool = False,
@@ -150,6 +151,7 @@ class QCNet(pl.LightningModule):
         self.topo_goal_distance_weight = topo_goal_distance_weight
         self.topo_goal_residual_scale = topo_goal_residual_scale
         self.topo_goal_anchor_blend = topo_goal_anchor_blend
+        self.topo_mode_endpoint_scale = topo_mode_endpoint_scale
         self.topo_aux_score = topo_aux_score
         self.topo_aux_score_detach = topo_aux_score_detach
         self.topo_aux_score_only = topo_aux_score_only
@@ -235,6 +237,7 @@ class QCNet(pl.LightningModule):
                 topo_goal_distance_weight=topo_goal_distance_weight,
                 topo_goal_residual_scale=topo_goal_residual_scale,
                 topo_goal_anchor_blend=topo_goal_anchor_blend,
+                topo_mode_endpoint_scale=topo_mode_endpoint_scale,
                 topo_aux_score=topo_aux_score,
                 topo_aux_score_detach=topo_aux_score_detach,
             )
@@ -286,6 +289,8 @@ class QCNet(pl.LightningModule):
             'decoder.mode_emb.',
             'decoder.query_mlp.',
             'decoder.to_goal.',
+            'decoder.mode_endpoint_anchor',
+            'decoder.to_mode_endpoint_delta.',
             'decoder.to_corridor_goal_delta.',
             'decoder.to_corridor_anchor_delta.',
             'decoder.to_anchor_residual.',
@@ -302,6 +307,8 @@ class QCNet(pl.LightningModule):
             'decoder.mode_emb.',
             'decoder.query_mlp.',
             'decoder.to_goal.',
+            'decoder.mode_endpoint_anchor',
+            'decoder.to_mode_endpoint_delta.',
             'decoder.to_corridor_goal_delta.',
             'decoder.to_corridor_anchor_delta.',
             'decoder.to_anchor_residual.',
@@ -322,11 +329,14 @@ class QCNet(pl.LightningModule):
             param.requires_grad_(False)
 
     def _freeze_teacher_overridden_proposal(self) -> None:
-        for module_name in ('to_goal', 'to_anchor_residual', 'to_corridor_goal_delta'):
+        for module_name in ('to_goal', 'to_anchor_residual', 'to_corridor_goal_delta', 'to_mode_endpoint_delta'):
             module = getattr(self.decoder, module_name, None)
             if module is not None:
                 for param in module.parameters():
                     param.requires_grad_(False)
+        mode_endpoint_anchor = getattr(self.decoder, 'mode_endpoint_anchor', None)
+        if mode_endpoint_anchor is not None:
+            mode_endpoint_anchor.requires_grad_(False)
 
     def _teacher_proposal_override(self, data: HeteroData):
         if not self.use_teacher_proposals:
@@ -809,11 +819,12 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--topo_score_loss_weight', type=float, default=0.0)
         parser.add_argument('--topo_score_temperature', type=float, default=0.2)
         parser.add_argument('--topo_proposal_type', type=str, default='goal_mlp',
-                            choices=['goal_mlp', 'corridor_goal', 'corridor_residual', 'corridor_query',
-                                     'corridor_query_safe'])
+                            choices=['goal_mlp', 'mode_endpoint', 'corridor_goal', 'corridor_residual',
+                                     'corridor_query', 'corridor_query_safe'])
         parser.add_argument('--topo_goal_distance_weight', type=float, default=0.05)
         parser.add_argument('--topo_goal_residual_scale', type=float, default=0.25)
         parser.add_argument('--topo_goal_anchor_blend', type=float, default=1.0)
+        parser.add_argument('--topo_mode_endpoint_scale', type=float, default=0.08)
         parser.add_argument('--topo_aux_score', action='store_true')
         parser.add_argument('--topo_aux_score_detach', type=bool, default=True)
         parser.add_argument('--topo_aux_score_only', action='store_true')
