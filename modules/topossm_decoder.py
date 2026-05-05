@@ -70,8 +70,7 @@ class TopoSSMDecoder(nn.Module):
         self.topo_aux_score_detach = topo_aux_score_detach
         self.corridor_dist_norm = corridor_dist_norm
         if topo_proposal_type not in (
-                'goal_mlp', 'corridor_goal', 'corridor_residual', 'corridor_query', 'corridor_query_safe',
-                'corridor_path_query'):
+                'goal_mlp', 'corridor_goal', 'corridor_residual', 'corridor_query', 'corridor_query_safe'):
             raise ValueError(f'{topo_proposal_type} is not a valid topo_proposal_type')
 
         self.mode_emb = nn.Embedding(num_modes, hidden_dim)
@@ -83,8 +82,7 @@ class TopoSSMDecoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.to_goal = MLPLayer(input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=output_dim)
-        if topo_proposal_type in (
-                'corridor_residual', 'corridor_query', 'corridor_query_safe', 'corridor_path_query'):
+        if topo_proposal_type in ('corridor_residual', 'corridor_query', 'corridor_query_safe'):
             self.to_corridor_goal_delta = nn.Sequential(
                 nn.LayerNorm(hidden_dim * 2 + output_dim),
                 nn.Linear(hidden_dim * 2 + output_dim, hidden_dim),
@@ -92,7 +90,7 @@ class TopoSSMDecoder(nn.Module):
                 nn.Dropout(dropout),
                 nn.Linear(hidden_dim, output_dim),
             )
-        if topo_proposal_type in ('corridor_query', 'corridor_query_safe', 'corridor_path_query'):
+        if topo_proposal_type in ('corridor_query', 'corridor_query_safe'):
             self.to_corridor_anchor_delta = nn.Sequential(
                 nn.LayerNorm(hidden_dim * 2 + output_dim + 2),
                 nn.Linear(hidden_dim * 2 + output_dim + 2, hidden_dim),
@@ -149,11 +147,10 @@ class TopoSSMDecoder(nn.Module):
                 nn.Linear(hidden_dim, 1),
             )
         self.apply(weight_init)
-        if topo_proposal_type in (
-                'corridor_residual', 'corridor_query', 'corridor_query_safe', 'corridor_path_query'):
+        if topo_proposal_type in ('corridor_residual', 'corridor_query', 'corridor_query_safe'):
             nn.init.zeros_(self.to_corridor_goal_delta[-1].weight)
             nn.init.zeros_(self.to_corridor_goal_delta[-1].bias)
-        if topo_proposal_type in ('corridor_query', 'corridor_query_safe', 'corridor_path_query'):
+        if topo_proposal_type in ('corridor_query', 'corridor_query_safe'):
             nn.init.zeros_(self.to_corridor_anchor_delta[-1].weight)
             nn.init.zeros_(self.to_corridor_anchor_delta[-1].bias)
 
@@ -165,9 +162,7 @@ class TopoSSMDecoder(nn.Module):
         mode_state = agent_state.unsqueeze(1) + self.mode_emb.weight.unsqueeze(0)
         mode_state = self.query_mlp(mode_state)
 
-        if self.topo_proposal_type == 'corridor_path_query':
-            goal_local, anchor_local = self._make_corridor_path_query_proposals(data, scene_enc, mode_state)
-        elif self.topo_proposal_type == 'corridor_query':
+        if self.topo_proposal_type == 'corridor_query':
             goal_local, anchor_local = self._make_corridor_query_proposals(data, scene_enc, mode_state)
         elif self.topo_proposal_type == 'corridor_query_safe':
             goal_local, anchor_local = self._make_corridor_query_safe_proposals(data, scene_enc, mode_state)
@@ -482,138 +477,6 @@ class TopoSSMDecoder(nn.Module):
                 map_pos,
                 map_feat,
             )
-        return goal_local, anchor_local
-
-    def _make_corridor_path_query_proposals(self,
-                                            data: HeteroData,
-                                            scene_enc: Mapping[str, torch.Tensor],
-                                            mode_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        device = mode_state.device
-        dtype = mode_state.dtype
-        fallback_goal = self.to_goal(mode_state)
-        fallback_anchor = self._make_goal_anchors(fallback_goal) + self.to_anchor_residual(mode_state).view(
-            -1, self.num_modes, self.num_future_steps, self.output_dim)
-
-        map_pos = data['map_polygon']['position'][:, :2].to(device=device, dtype=dtype)
-        if map_pos.numel() == 0:
-            return fallback_goal, fallback_anchor
-
-        map_feat = scene_enc['x_pl'][:, -1].to(device=device, dtype=dtype)
-        agent_origin = data['agent']['position'][:, self.num_historical_steps - 1].to(device=device, dtype=dtype)
-        agent_heading = data['agent']['heading'][:, self.num_historical_steps - 1].to(device=device, dtype=dtype)
-        goal_local = fallback_goal.new_empty(fallback_goal.shape)
-        anchor_local = fallback_anchor.new_empty(fallback_anchor.shape)
-
-        if isinstance(data, Batch):
-            agent_batch = data['agent']['batch'].to(device=device)
-            map_batch = data['map_polygon']['batch'].to(device=device)
-            for batch_id in torch.unique(agent_batch, sorted=True):
-                agent_idx = torch.nonzero(agent_batch == batch_id, as_tuple=False).flatten()
-                map_idx = torch.nonzero(map_batch == batch_id, as_tuple=False).flatten()
-                if agent_idx.numel() == 0:
-                    continue
-                if map_idx.numel() == 0:
-                    goal_local[agent_idx] = fallback_goal[agent_idx]
-                    anchor_local[agent_idx] = fallback_anchor[agent_idx]
-                    continue
-                goal_part, anchor_part = self._select_corridor_path_query_for_agents(
-                    mode_state[agent_idx],
-                    fallback_goal[agent_idx],
-                    fallback_anchor[agent_idx],
-                    agent_origin[agent_idx],
-                    agent_heading[agent_idx],
-                    map_pos[map_idx],
-                    map_feat[map_idx],
-                )
-                goal_local[agent_idx] = goal_part
-                anchor_local[agent_idx] = anchor_part
-        else:
-            goal_local, anchor_local = self._select_corridor_path_query_for_agents(
-                mode_state,
-                fallback_goal,
-                fallback_anchor,
-                agent_origin,
-                agent_heading,
-                map_pos,
-                map_feat,
-            )
-        return goal_local, anchor_local
-
-    def _select_corridor_path_query_for_agents(self,
-                                               mode_state: torch.Tensor,
-                                               fallback_goal: torch.Tensor,
-                                               fallback_anchor: torch.Tensor,
-                                               agent_origin: torch.Tensor,
-                                               agent_heading: torch.Tensor,
-                                               map_pos: torch.Tensor,
-                                               map_feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        n = mode_state.size(0)
-        fallback_global = self._local_to_global(
-            fallback_goal.unsqueeze(2),
-            agent_origin[:, :2],
-            agent_heading,
-        ).squeeze(2)
-        distance = torch.cdist(fallback_global.reshape(-1, self.output_dim), map_pos).reshape(
-            n, self.num_modes, -1)
-        query_score = torch.einsum('nkh,mh->nkm', mode_state, map_feat) / math.sqrt(self.hidden_dim)
-        score = query_score - self.topo_goal_distance_weight * distance / self.corridor_dist_norm
-
-        # Use a different high-scoring corridor rank per mode to increase
-        # oracle coverage instead of letting all modes collapse to the same lane.
-        topk = min(max(self.num_modes * 2, 8), score.size(-1))
-        _, top_idx = score.topk(k=topk, dim=-1)
-        rank = torch.arange(self.num_modes, device=mode_state.device).clamp(max=topk - 1)
-        selected = top_idx.gather(
-            dim=-1,
-            index=rank.view(1, self.num_modes, 1).expand(n, -1, -1),
-        ).squeeze(-1)
-        selected_global = map_pos[selected]
-
-        alpha = torch.linspace(
-            1.0 / self.num_future_steps,
-            1.0,
-            self.num_future_steps,
-            device=mode_state.device,
-            dtype=mode_state.dtype,
-        ).view(1, 1, self.num_future_steps, 1)
-        start_global = agent_origin[:, None, None, :2]
-        path_query_global = start_global + alpha * (selected_global.unsqueeze(2) - start_global)
-        path_dist = torch.cdist(path_query_global.reshape(n * self.num_modes * self.num_future_steps, 2), map_pos)
-        path_nearest = path_dist.argmin(dim=-1).reshape(n, self.num_modes, self.num_future_steps)
-        path_global = map_pos[path_nearest]
-        path_local = self._global_to_local(
-            path_global.reshape(n * self.num_modes, self.num_future_steps, self.output_dim),
-            agent_origin[:, None, :2].expand(n, self.num_modes, self.output_dim).reshape(n * self.num_modes, -1),
-            agent_heading[:, None].expand(n, self.num_modes).reshape(n * self.num_modes),
-        ).reshape(n, self.num_modes, self.num_future_steps, self.output_dim)
-
-        selected_feat = map_feat[selected]
-        path_goal = path_local[:, :, -1]
-        corridor_offset = path_goal - fallback_goal
-        goal_delta_input = torch.cat([mode_state, selected_feat, corridor_offset], dim=-1)
-        goal_delta = self.topo_goal_residual_scale * torch.tanh(self.to_corridor_goal_delta(goal_delta_input))
-
-        distance_norm = corridor_offset.norm(dim=-1, keepdim=True) / self.corridor_dist_norm
-        mode_progress = torch.linspace(
-            0.0,
-            1.0,
-            self.num_modes,
-            device=mode_state.device,
-            dtype=mode_state.dtype,
-        ).view(1, self.num_modes, 1).expand(n, -1, -1)
-        anchor_delta_input = torch.cat([mode_state, selected_feat, corridor_offset, distance_norm, mode_progress], dim=-1)
-        anchor_delta = self.topo_goal_residual_scale * torch.tanh(
-            self.to_corridor_anchor_delta(anchor_delta_input).view(
-                n,
-                self.num_modes,
-                self.num_future_steps,
-                self.output_dim,
-            )
-        )
-        corridor_anchor = path_local + self._make_goal_anchors(goal_delta) + anchor_delta
-        blend = max(0.0, min(float(self.topo_goal_anchor_blend), 1.0))
-        goal_local = fallback_goal + blend * (path_goal + goal_delta - fallback_goal)
-        anchor_local = fallback_anchor + blend * (corridor_anchor - fallback_anchor)
         return goal_local, anchor_local
 
     def _select_corridor_query_safe_for_agents(self,
