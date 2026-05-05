@@ -91,6 +91,8 @@ class QCNet(pl.LightningModule):
                  topo_aux_score_loss_weight: float = 0.0,
                  topo_aux_gt_score_loss_weight: float = 0.0,
                  topo_aux_score_mix: float = 0.0,
+                 topo_diversity_loss_weight: float = 0.0,
+                 topo_diversity_margin: float = 0.20,
                  topo_proposal_distill_only: bool = False,
                  topo_motion_distill_only: bool = False,
                  decoder_type: str = 'qcnet',
@@ -156,6 +158,8 @@ class QCNet(pl.LightningModule):
         self.topo_aux_score_loss_weight = topo_aux_score_loss_weight
         self.topo_aux_gt_score_loss_weight = topo_aux_gt_score_loss_weight
         self.topo_aux_score_mix = topo_aux_score_mix
+        self.topo_diversity_loss_weight = topo_diversity_loss_weight
+        self.topo_diversity_margin = topo_diversity_margin
         self.topo_proposal_distill_only = topo_proposal_distill_only
         self.topo_motion_distill_only = topo_motion_distill_only
         self.decoder_type = decoder_type
@@ -398,9 +402,13 @@ class QCNet(pl.LightningModule):
             pi=pi,
             reg_mask=reg_mask,
             cls_mask=cls_mask)
+        diversity_loss = self._mode_diversity_loss(pred=pred, cls_mask=cls_mask)
         self.log('train_reg_loss_propose', reg_loss_propose, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_reg_loss_refine', reg_loss_refine, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_cls_loss', cls_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+        if diversity_loss is not None:
+            self.log('train_topo_diversity_loss', diversity_loss, prog_bar=False, on_step=True, on_epoch=True,
+                     batch_size=1)
         if topo_corridor_loss is not None:
             self.log('train_topo_corridor_loss', topo_corridor_loss, prog_bar=False, on_step=True, on_epoch=True,
                      batch_size=1)
@@ -460,6 +468,8 @@ class QCNet(pl.LightningModule):
             loss = loss + self.topo_aux_score_loss_weight * topo_aux_score_loss
         if topo_aux_gt_score_loss is not None:
             loss = loss + self.topo_aux_gt_score_loss_weight * topo_aux_gt_score_loss
+        if diversity_loss is not None:
+            loss = loss + self.topo_diversity_loss_weight * diversity_loss
         distill_scale = self._distill_scale()
         if distill_losses:
             loss = loss + distill_scale * (
@@ -530,6 +540,10 @@ class QCNet(pl.LightningModule):
                      batch_size=1, sync_dist=True)
         if topo_aux_score_loss is not None:
             self.log('val_topo_aux_score_loss', topo_aux_score_loss, prog_bar=False, on_step=False, on_epoch=True,
+                     batch_size=1, sync_dist=True)
+        diversity_loss = self._mode_diversity_loss(pred=pred, cls_mask=cls_mask)
+        if diversity_loss is not None:
+            self.log('val_topo_diversity_loss', diversity_loss, prog_bar=False, on_step=False, on_epoch=True,
                      batch_size=1, sync_dist=True)
 
         if self.dataset in ('argoverse_v2', 'interaction_digir'):
@@ -693,6 +707,21 @@ class QCNet(pl.LightningModule):
                 aux_score_loss * cls_mask.to(dtype=aux_score_loss.dtype)).sum() / cls_mask.sum().clamp_(min=1)
         return corridor_loss, score_loss, aux_score_loss
 
+    def _mode_diversity_loss(self, pred, cls_mask: torch.Tensor):
+        if self.topo_diversity_loss_weight <= 0.0 or self.num_modes <= 1:
+            return None
+        final_pos = pred['loc_refine_pos'][:, :, -1, :self.output_dim]
+        pair_dist = torch.cdist(final_pos, final_pos, p=2)
+        keep = torch.triu(
+            torch.ones(self.num_modes, self.num_modes, device=final_pos.device, dtype=torch.bool),
+            diagonal=1)
+        if keep.sum() == 0:
+            return None
+        margin = max(float(self.topo_diversity_margin), 1e-6)
+        per_sample = F.relu(margin - pair_dist[:, keep]).pow(2).mean(dim=-1)
+        cls_weight = cls_mask.to(dtype=per_sample.dtype)
+        return (per_sample * cls_weight).sum() / cls_weight.sum().clamp(min=1.0)
+
     def _eval_pi_logits(self, pred, pi: torch.Tensor) -> torch.Tensor:
         mix = max(0.0, min(float(self.topo_aux_score_mix), 1.0))
         if mix <= 0.0 or 'topo_aux_pi' not in pred:
@@ -820,6 +849,8 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--topo_aux_score_loss_weight', type=float, default=0.0)
         parser.add_argument('--topo_aux_gt_score_loss_weight', type=float, default=0.0)
         parser.add_argument('--topo_aux_score_mix', type=float, default=0.0)
+        parser.add_argument('--topo_diversity_loss_weight', type=float, default=0.0)
+        parser.add_argument('--topo_diversity_margin', type=float, default=0.20)
         parser.add_argument('--topo_proposal_distill_only', action='store_true')
         parser.add_argument('--topo_motion_distill_only', action='store_true')
         parser.add_argument('--decoder_type', type=str, default='qcnet', choices=['qcnet', 'topossm'])
