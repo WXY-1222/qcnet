@@ -120,6 +120,9 @@ if __name__ == '__main__':
             param.requires_grad_(False)
         model.teacher_model = teacher
         print('[DistillTeacher] loaded frozen teacher from {}'.format(args.distill_teacher_checkpoint))
+        if args.ckpt_path:
+            model.strict_loading = False
+            print('[Checkpoint] using non-strict model restore because a frozen distill teacher is attached')
     datamodule = {
         'argoverse_v2': ArgoverseV2DataModule,
         'interaction_digir': InteractionDIGIRDataModule,
