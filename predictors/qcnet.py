@@ -86,6 +86,8 @@ class QCNet(pl.LightningModule):
                  topo_goal_residual_scale: float = 0.25,
                  topo_goal_anchor_blend: float = 1.0,
                  topo_mode_endpoint_scale: float = 0.08,
+                 topo_endpoint_diversity_loss_weight: float = 0.0,
+                 topo_endpoint_diversity_margin: float = 0.12,
                  topo_aux_score: bool = False,
                  topo_aux_score_detach: bool = True,
                  topo_aux_score_only: bool = False,
@@ -153,6 +155,8 @@ class QCNet(pl.LightningModule):
         self.topo_goal_residual_scale = topo_goal_residual_scale
         self.topo_goal_anchor_blend = topo_goal_anchor_blend
         self.topo_mode_endpoint_scale = topo_mode_endpoint_scale
+        self.topo_endpoint_diversity_loss_weight = topo_endpoint_diversity_loss_weight
+        self.topo_endpoint_diversity_margin = topo_endpoint_diversity_margin
         self.topo_aux_score = topo_aux_score
         self.topo_aux_score_detach = topo_aux_score_detach
         self.topo_aux_score_only = topo_aux_score_only
@@ -406,6 +410,10 @@ class QCNet(pl.LightningModule):
             best_mode=best_mode,
             reg_mask=reg_mask,
             cls_mask=cls_mask)
+        topo_endpoint_diversity_loss = self._protected_endpoint_diversity_loss(
+            pred=pred,
+            best_mode=best_mode,
+            cls_mask=cls_mask)
         distill_losses = self._teacher_distill_losses(
             data=data,
             pred=pred,
@@ -424,6 +432,9 @@ class QCNet(pl.LightningModule):
         if topo_aux_score_loss is not None:
             self.log('train_topo_aux_score_loss', topo_aux_score_loss, prog_bar=False, on_step=True, on_epoch=True,
                      batch_size=1)
+        if topo_endpoint_diversity_loss is not None:
+            self.log('train_topo_endpoint_diversity_loss', topo_endpoint_diversity_loss, prog_bar=False, on_step=True,
+                     on_epoch=True, batch_size=1)
         topo_aux_gt_score_loss = None
         if 'topo_aux_pi' in pred:
             topo_aux_gt_score_loss = F.cross_entropy(pred['topo_aux_pi'], best_mode.detach(), reduction='none')
@@ -456,6 +467,8 @@ class QCNet(pl.LightningModule):
                     self.distill_endpoint_weight * distill_losses.get('distill_endpoint_loss', 0.0))
             if topo_corridor_loss is not None:
                 proposal_loss = proposal_loss + self.topo_corridor_loss_weight * topo_corridor_loss
+            if topo_endpoint_diversity_loss is not None:
+                proposal_loss = proposal_loss + self.topo_endpoint_diversity_loss_weight * topo_endpoint_diversity_loss
             return proposal_loss
         if self.topo_motion_distill_only:
             motion_loss = reg_loss_propose + reg_loss_refine
@@ -465,6 +478,8 @@ class QCNet(pl.LightningModule):
                     self.distill_refine_weight * distill_losses.get('distill_refine_loss', 0.0))
             if topo_corridor_loss is not None:
                 motion_loss = motion_loss + self.topo_corridor_loss_weight * topo_corridor_loss
+            if topo_endpoint_diversity_loss is not None:
+                motion_loss = motion_loss + self.topo_endpoint_diversity_loss_weight * topo_endpoint_diversity_loss
             return motion_loss
         loss = reg_loss_propose + reg_loss_refine + cls_loss
         if topo_corridor_loss is not None:
@@ -475,6 +490,8 @@ class QCNet(pl.LightningModule):
             loss = loss + self.topo_aux_score_loss_weight * topo_aux_score_loss
         if topo_aux_gt_score_loss is not None:
             loss = loss + self.topo_aux_gt_score_loss_weight * topo_aux_gt_score_loss
+        if topo_endpoint_diversity_loss is not None:
+            loss = loss + self.topo_endpoint_diversity_loss_weight * topo_endpoint_diversity_loss
         distill_scale = self._distill_scale()
         if distill_losses:
             loss = loss + distill_scale * (
@@ -624,6 +641,41 @@ class QCNet(pl.LightningModule):
             return
         else:
             raise ValueError('{} is not a valid dataset'.format(self.dataset))
+
+    def _protected_endpoint_diversity_loss(self,
+                                           pred,
+                                           best_mode: torch.Tensor,
+                                           cls_mask: torch.Tensor):
+        if self.topo_endpoint_diversity_loss_weight <= 0.0:
+            return None
+        if 'loc_refine_pos' not in pred or pred['loc_refine_pos'].size(1) <= 1:
+            return None
+
+        endpoint = pred['loc_refine_pos'][:, :, -1, :self.output_dim]
+        num_agents, num_modes, _ = endpoint.shape
+        mode_ids = torch.arange(num_modes, device=endpoint.device).view(1, num_modes)
+        nonbest = mode_ids != best_mode.detach().view(-1, 1)
+        valid = cls_mask.to(dtype=endpoint.dtype)
+        valid_den = valid.sum().clamp(min=1.0)
+        margin = max(float(self.topo_endpoint_diversity_margin), 1e-6)
+
+        best_endpoint = endpoint[torch.arange(num_agents, device=endpoint.device), best_mode].detach()
+        dist_to_best = torch.norm(endpoint - best_endpoint.unsqueeze(1), p=2, dim=-1)
+        repel_best = F.relu(margin - dist_to_best) * nonbest.to(dtype=endpoint.dtype)
+        repel_best = repel_best.sum(dim=-1) / nonbest.sum(dim=-1).clamp(min=1).to(dtype=endpoint.dtype)
+
+        pair_dist = torch.cdist(endpoint, endpoint, p=2)
+        pair_mask = torch.triu(
+            torch.ones(num_modes, num_modes, device=endpoint.device, dtype=torch.bool),
+            diagonal=1,
+        ).unsqueeze(0)
+        pair_mask = pair_mask & nonbest.unsqueeze(2) & nonbest.unsqueeze(1)
+        pair_loss = F.relu(margin - pair_dist) * pair_mask.to(dtype=endpoint.dtype)
+        pair_den = pair_mask.sum(dim=(1, 2)).clamp(min=1).to(dtype=endpoint.dtype)
+        pair_loss = pair_loss.sum(dim=(1, 2)) / pair_den
+
+        diversity_loss = 0.5 * (repel_best + pair_loss)
+        return (diversity_loss * valid).sum() / valid_den
 
     def on_test_end(self):
         if self.dataset == 'argoverse_v2':
@@ -845,6 +897,8 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--topo_goal_residual_scale', type=float, default=0.25)
         parser.add_argument('--topo_goal_anchor_blend', type=float, default=1.0)
         parser.add_argument('--topo_mode_endpoint_scale', type=float, default=0.08)
+        parser.add_argument('--topo_endpoint_diversity_loss_weight', type=float, default=0.0)
+        parser.add_argument('--topo_endpoint_diversity_margin', type=float, default=0.12)
         parser.add_argument('--topo_aux_score', action='store_true')
         parser.add_argument('--topo_aux_score_detach', type=bool, default=True)
         parser.add_argument('--topo_aux_score_only', action='store_true')
