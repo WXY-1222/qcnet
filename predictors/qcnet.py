@@ -99,6 +99,7 @@ class QCNet(pl.LightningModule):
                  distill_refine_weight: float = 0.0,
                  distill_score_weight: float = 0.0,
                  distill_rank_weight: float = 0.0,
+                 distill_endpoint_weight: float = 0.0,
                  distill_temperature: float = 1.0,
                  distill_warmup_epochs: int = 0,
                  freeze_encoder: bool = False,
@@ -165,6 +166,7 @@ class QCNet(pl.LightningModule):
         self.distill_refine_weight = distill_refine_weight
         self.distill_score_weight = distill_score_weight
         self.distill_rank_weight = distill_rank_weight
+        self.distill_endpoint_weight = distill_endpoint_weight
         self.distill_temperature = distill_temperature
         self.distill_warmup_epochs = distill_warmup_epochs
         self.freeze_encoder = freeze_encoder
@@ -450,7 +452,8 @@ class QCNet(pl.LightningModule):
             proposal_loss = reg_loss_propose
             if distill_losses:
                 proposal_loss = proposal_loss + self._distill_scale() * (
-                    self.distill_propose_weight * distill_losses.get('distill_propose_loss', 0.0))
+                    self.distill_propose_weight * distill_losses.get('distill_propose_loss', 0.0) +
+                    self.distill_endpoint_weight * distill_losses.get('distill_endpoint_loss', 0.0))
             if topo_corridor_loss is not None:
                 proposal_loss = proposal_loss + self.topo_corridor_loss_weight * topo_corridor_loss
             return proposal_loss
@@ -478,7 +481,8 @@ class QCNet(pl.LightningModule):
                 self.distill_propose_weight * distill_losses.get('distill_propose_loss', 0.0) +
                 self.distill_refine_weight * distill_losses.get('distill_refine_loss', 0.0) +
                 self.distill_score_weight * distill_losses.get('distill_score_loss', 0.0) +
-                self.distill_rank_weight * distill_losses.get('distill_rank_loss', 0.0))
+                self.distill_rank_weight * distill_losses.get('distill_rank_loss', 0.0) +
+                self.distill_endpoint_weight * distill_losses.get('distill_endpoint_loss', 0.0))
         return loss
 
     def validation_step(self,
@@ -725,7 +729,8 @@ class QCNet(pl.LightningModule):
         if self.teacher_model is None:
             return {}
         if (self.distill_propose_weight <= 0.0 and self.distill_refine_weight <= 0.0 and
-                self.distill_score_weight <= 0.0 and self.distill_rank_weight <= 0.0):
+                self.distill_score_weight <= 0.0 and self.distill_rank_weight <= 0.0 and
+                self.distill_endpoint_weight <= 0.0):
             return {}
 
         self.teacher_model.eval()
@@ -751,6 +756,19 @@ class QCNet(pl.LightningModule):
             loss = (teacher_prob * min_dist).sum(dim=-1)
             loss = (loss * cls_weight).sum() / cls_den
             return loss, min_student, teacher_prob
+
+        if self.distill_endpoint_weight > 0.0:
+            teacher_prob = F.softmax(teacher_pred['pi'].detach() / temperature, dim=-1)
+            student_endpoint = pred['loc_propose_pos'][:, :, -1, :self.output_dim]
+            teacher_endpoint = teacher_pred['loc_refine_pos'].detach()[:, :, -1, :self.output_dim]
+            pair_fde = torch.norm(
+                student_endpoint[:, :, None] - teacher_endpoint[:, None],
+                p=2,
+                dim=-1)
+            min_fde = pair_fde.min(dim=1).values
+            endpoint_loss = (teacher_prob * min_fde).sum(dim=-1)
+            endpoint_loss = (endpoint_loss * cls_weight).sum() / cls_den
+            losses['distill_endpoint_loss'] = endpoint_loss
 
         if self.distill_propose_weight > 0.0:
             propose_loss, _, _ = matched_traj_loss(pred['loc_propose_pos'], teacher_pred['loc_propose_pos'])
@@ -840,6 +858,7 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--distill_refine_weight', type=float, default=0.0)
         parser.add_argument('--distill_score_weight', type=float, default=0.0)
         parser.add_argument('--distill_rank_weight', type=float, default=0.0)
+        parser.add_argument('--distill_endpoint_weight', type=float, default=0.0)
         parser.add_argument('--distill_temperature', type=float, default=1.0)
         parser.add_argument('--distill_warmup_epochs', type=int, default=0)
         parser.add_argument('--freeze_encoder', action='store_true')
