@@ -291,6 +291,7 @@ class QCNet(pl.LightningModule):
             'decoder.to_goal.',
             'decoder.mode_endpoint_anchor',
             'decoder.to_mode_endpoint_delta.',
+            'decoder.to_corridor_mode_endpoint_delta.',
             'decoder.to_corridor_goal_delta.',
             'decoder.to_corridor_anchor_delta.',
             'decoder.to_anchor_residual.',
@@ -309,6 +310,7 @@ class QCNet(pl.LightningModule):
             'decoder.to_goal.',
             'decoder.mode_endpoint_anchor',
             'decoder.to_mode_endpoint_delta.',
+            'decoder.to_corridor_mode_endpoint_delta.',
             'decoder.to_corridor_goal_delta.',
             'decoder.to_corridor_anchor_delta.',
             'decoder.to_anchor_residual.',
@@ -819,8 +821,8 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--topo_score_loss_weight', type=float, default=0.0)
         parser.add_argument('--topo_score_temperature', type=float, default=0.2)
         parser.add_argument('--topo_proposal_type', type=str, default='goal_mlp',
-                            choices=['goal_mlp', 'mode_endpoint', 'corridor_goal', 'corridor_residual',
-                                     'corridor_query', 'corridor_query_safe'])
+                            choices=['goal_mlp', 'mode_endpoint', 'corridor_mode_endpoint', 'corridor_goal',
+                                     'corridor_residual', 'corridor_query', 'corridor_query_safe'])
         parser.add_argument('--topo_goal_distance_weight', type=float, default=0.05)
         parser.add_argument('--topo_goal_residual_scale', type=float, default=0.25)
         parser.add_argument('--topo_goal_anchor_blend', type=float, default=1.0)

@@ -72,8 +72,8 @@ class TopoSSMDecoder(nn.Module):
         self.topo_aux_score_detach = topo_aux_score_detach
         self.corridor_dist_norm = corridor_dist_norm
         if topo_proposal_type not in (
-                'goal_mlp', 'mode_endpoint', 'corridor_goal', 'corridor_residual', 'corridor_query',
-                'corridor_query_safe'):
+                'goal_mlp', 'mode_endpoint', 'corridor_mode_endpoint', 'corridor_goal', 'corridor_residual',
+                'corridor_query', 'corridor_query_safe'):
             raise ValueError(f'{topo_proposal_type} is not a valid topo_proposal_type')
 
         self.mode_emb = nn.Embedding(num_modes, hidden_dim)
@@ -85,9 +85,17 @@ class TopoSSMDecoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.to_goal = MLPLayer(input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=output_dim)
-        if topo_proposal_type == 'mode_endpoint':
+        if topo_proposal_type in ('mode_endpoint', 'corridor_mode_endpoint'):
             self.mode_endpoint_anchor = nn.Parameter(torch.zeros(num_modes, output_dim))
             self.to_mode_endpoint_delta = nn.Sequential(
+                nn.LayerNorm(hidden_dim * 2 + output_dim * 2),
+                nn.Linear(hidden_dim * 2 + output_dim * 2, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+            )
+        if topo_proposal_type == 'corridor_mode_endpoint':
+            self.to_corridor_mode_endpoint_delta = nn.Sequential(
                 nn.LayerNorm(hidden_dim * 2 + output_dim * 2),
                 nn.Linear(hidden_dim * 2 + output_dim * 2, hidden_dim),
                 nn.GELU(),
@@ -159,10 +167,13 @@ class TopoSSMDecoder(nn.Module):
                 nn.Linear(hidden_dim, 1),
             )
         self.apply(weight_init)
-        if topo_proposal_type == 'mode_endpoint':
+        if topo_proposal_type in ('mode_endpoint', 'corridor_mode_endpoint'):
             self._init_mode_endpoint_anchor()
             nn.init.zeros_(self.to_mode_endpoint_delta[-1].weight)
             nn.init.zeros_(self.to_mode_endpoint_delta[-1].bias)
+        if topo_proposal_type == 'corridor_mode_endpoint':
+            nn.init.zeros_(self.to_corridor_mode_endpoint_delta[-1].weight)
+            nn.init.zeros_(self.to_corridor_mode_endpoint_delta[-1].bias)
         if topo_proposal_type in ('corridor_residual', 'corridor_query', 'corridor_query_safe'):
             nn.init.zeros_(self.to_corridor_goal_delta[-1].weight)
             nn.init.zeros_(self.to_corridor_goal_delta[-1].bias)
@@ -194,6 +205,9 @@ class TopoSSMDecoder(nn.Module):
             anchor_residual = self.to_anchor_residual(mode_state).view(
                 -1, self.num_modes, self.num_future_steps, self.output_dim)
             anchor_local = anchor_base + anchor_residual
+        elif self.topo_proposal_type == 'corridor_mode_endpoint':
+            goal_local, anchor_local = self._make_corridor_mode_endpoint_proposals(
+                data, scene_enc, agent_state, mode_state)
         elif self.topo_proposal_type == 'mode_endpoint':
             goal_local = self._make_mode_endpoint_goals(agent_state, mode_state)
             anchor_base = self._make_goal_anchors(goal_local)
@@ -317,6 +331,104 @@ class TopoSSMDecoder(nn.Module):
         endpoint_delta = mode_anchor + self.to_mode_endpoint_delta(delta_input)
         endpoint_delta = self.topo_mode_endpoint_scale * torch.tanh(endpoint_delta)
         return fallback_goal + endpoint_delta
+
+    def _make_corridor_mode_endpoint_proposals(self,
+                                               data: HeteroData,
+                                               scene_enc: Mapping[str, torch.Tensor],
+                                               agent_state: torch.Tensor,
+                                               mode_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = mode_state.device
+        dtype = mode_state.dtype
+        base_goal = self._make_mode_endpoint_goals(agent_state, mode_state)
+        fallback_anchor = self._make_goal_anchors(base_goal) + self.to_anchor_residual(mode_state).view(
+            -1, self.num_modes, self.num_future_steps, self.output_dim)
+
+        map_pos = data['map_polygon']['position'][:, :2].to(device=device, dtype=dtype)
+        if map_pos.numel() == 0:
+            return base_goal, fallback_anchor
+
+        map_feat = scene_enc['x_pl'][:, -1].to(device=device, dtype=dtype)
+        agent_origin = data['agent']['position'][:, self.num_historical_steps - 1].to(device=device, dtype=dtype)
+        agent_heading = data['agent']['heading'][:, self.num_historical_steps - 1].to(device=device, dtype=dtype)
+        goal_local = base_goal.new_empty(base_goal.shape)
+        anchor_local = fallback_anchor.new_empty(fallback_anchor.shape)
+
+        if isinstance(data, Batch):
+            agent_batch = data['agent']['batch'].to(device=device)
+            map_batch = data['map_polygon']['batch'].to(device=device)
+            for batch_id in torch.unique(agent_batch, sorted=True):
+                agent_idx = torch.nonzero(agent_batch == batch_id, as_tuple=False).flatten()
+                map_idx = torch.nonzero(map_batch == batch_id, as_tuple=False).flatten()
+                if agent_idx.numel() == 0:
+                    continue
+                if map_idx.numel() == 0:
+                    goal_local[agent_idx] = base_goal[agent_idx]
+                    anchor_local[agent_idx] = fallback_anchor[agent_idx]
+                    continue
+                goal_part, anchor_part = self._select_corridor_mode_endpoint_for_agents(
+                    mode_state[agent_idx],
+                    base_goal[agent_idx],
+                    fallback_anchor[agent_idx],
+                    agent_origin[agent_idx],
+                    agent_heading[agent_idx],
+                    map_pos[map_idx],
+                    map_feat[map_idx],
+                )
+                goal_local[agent_idx] = goal_part
+                anchor_local[agent_idx] = anchor_part
+        else:
+            goal_local, anchor_local = self._select_corridor_mode_endpoint_for_agents(
+                mode_state,
+                base_goal,
+                fallback_anchor,
+                agent_origin,
+                agent_heading,
+                map_pos,
+                map_feat,
+            )
+        return goal_local, anchor_local
+
+    def _select_corridor_mode_endpoint_for_agents(self,
+                                                  mode_state: torch.Tensor,
+                                                  base_goal: torch.Tensor,
+                                                  fallback_anchor: torch.Tensor,
+                                                  agent_origin: torch.Tensor,
+                                                  agent_heading: torch.Tensor,
+                                                  map_pos: torch.Tensor,
+                                                  map_feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        base_global = self._local_to_global(
+            base_goal.unsqueeze(2),
+            agent_origin[:, :2],
+            agent_heading,
+        ).squeeze(2)
+        distance = torch.cdist(base_global.reshape(-1, self.output_dim), map_pos).reshape(
+            mode_state.size(0), self.num_modes, -1)
+        topk = min(8, distance.size(-1))
+        nearest_dist, nearest_idx = distance.topk(k=topk, dim=-1, largest=False)
+        query_score_all = torch.einsum('nkh,mh->nkm', mode_state, map_feat) / math.sqrt(self.hidden_dim)
+        query_score = query_score_all.gather(dim=-1, index=nearest_idx)
+        local_score = query_score - self.topo_goal_distance_weight * nearest_dist / self.corridor_dist_norm
+        corridor_order = local_score.topk(k=topk, dim=-1, largest=True).indices
+        mode_rank = torch.linspace(
+            0,
+            topk - 1,
+            self.num_modes,
+            device=mode_state.device,
+        ).round().long().view(1, self.num_modes, 1)
+        selected = nearest_idx.gather(
+            dim=-1,
+            index=corridor_order.gather(dim=-1, index=mode_rank.expand(mode_state.size(0), -1, -1)),
+        ).squeeze(-1)
+        selected_global = map_pos[selected]
+        selected_local = self._global_to_local(selected_global, agent_origin[:, :2], agent_heading)
+        selected_feat = map_feat[selected]
+        corridor_offset = selected_local - base_goal
+        delta_input = torch.cat([mode_state, selected_feat, base_goal, corridor_offset], dim=-1)
+        goal_delta = self.topo_goal_residual_scale * torch.tanh(self.to_corridor_mode_endpoint_delta(delta_input))
+        blend = max(0.0, min(float(self.topo_goal_anchor_blend), 1.0))
+        goal_local = base_goal + blend * goal_delta
+        anchor_local = fallback_anchor + self._make_goal_anchors(blend * goal_delta)
+        return goal_local, anchor_local
 
     def _make_corridor_goals(self,
                              data: HeteroData,
@@ -765,8 +877,13 @@ class TopoSSMDecoder(nn.Module):
         rot[:, 0, 1] = -sin
         rot[:, 1, 0] = sin
         rot[:, 1, 1] = cos
-        centered = global_xy - origin[:, :2].view(-1, 1, 2)
-        return torch.matmul(centered, rot)
+        if global_xy.dim() == 2:
+            centered = global_xy - origin[:, :2]
+            return torch.matmul(centered.unsqueeze(1), rot).squeeze(1)
+        view_shape = [origin.size(0)] + [1] * (global_xy.dim() - 2) + [2]
+        rot_shape = [origin.size(0)] + [1] * (global_xy.dim() - 2) + [2, 2]
+        centered = global_xy - origin[:, :2].view(*view_shape)
+        return torch.matmul(centered.unsqueeze(-2), rot.view(*rot_shape)).squeeze(-2)
 
     def _heads_from_positions(self,
                               loc_pos: torch.Tensor,
