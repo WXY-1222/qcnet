@@ -21,7 +21,7 @@ SAVE_ROOT="${SAVE_ROOT:-${BASE_OUT}/qcnet_topossm_decoder_mode_endpoint_h8_f12_s
 CKPT_PATH="${CKPT_PATH:-${SAVE_ROOT}/lightning_logs/version_0/checkpoints/epoch=4-step=1075.ckpt}"
 TEACHER_CKPT="${TEACHER_CKPT:-${BASE_OUT}/qcnet_topossm_safetyft_h8_f12_s5_k6_4gpu_20260503/lightning_logs/version_0/checkpoints/epoch=7-step=1288.ckpt}"
 RUN_LOG="${RUN_LOG:-${LOG_DIR}/qcnet_topossm_decoder_mode_endpoint_resume_h8_f12_s5_k6_4gpu_20260505.log}"
-CKPT_DIR="${SAVE_ROOT}/lightning_logs/version_0/checkpoints"
+LIGHTNING_ROOT="${SAVE_ROOT}/lightning_logs"
 
 mkdir -p "${LOG_DIR}"
 cd "${REPO}"
@@ -33,16 +33,16 @@ log() {
 }
 
 metric_json() {
-  local ckpt_dir="$1"
-  "${PYTHON_BIN}" - "${ckpt_dir}" <<'PY'
+  local lightning_root="$1"
+  "${PYTHON_BIN}" - "${lightning_root}" <<'PY'
 import glob
 import json
 import os
 import sys
 import torch
 
-ckpt_dir = sys.argv[1]
-paths = sorted(glob.glob(os.path.join(ckpt_dir, "*.ckpt")), key=os.path.getmtime)
+lightning_root = sys.argv[1]
+paths = sorted(glob.glob(os.path.join(lightning_root, "version_*", "checkpoints", "*.ckpt")), key=os.path.getmtime)
 out = {"latest_epoch": None, "latest_ade": None, "best_ade": None, "best_path": None, "num_ckpts": len(paths)}
 if paths:
     ckpt = torch.load(paths[-1], map_location="cpu")
@@ -176,7 +176,7 @@ log "Train PID ${pid}"
 
 while kill -0 "${pid}" 2>/dev/null; do
   sleep "${MONITOR_INTERVAL_SEC}"
-  metrics="$(metric_json "${CKPT_DIR}")"
+  metrics="$(metric_json "${LIGHTNING_ROOT}")"
   latest_epoch="$(json_value "${metrics}" latest_epoch)"
   latest_ade="$(json_value "${metrics}" latest_ade)"
   best_ade="$(json_value "${metrics}" best_ade)"
@@ -205,7 +205,7 @@ while kill -0 "${pid}" 2>/dev/null; do
 done
 
 wait "${pid}" || true
-metrics="$(metric_json "${CKPT_DIR}")"
+metrics="$(metric_json "${LIGHTNING_ROOT}")"
 log "Training process exited. metrics=${metrics}"
 best_ade="$(json_value "${metrics}" best_ade)"
 if [[ -n "${best_ade}" ]] && float_le "${best_ade}" "${TARGET_ADE}"; then
