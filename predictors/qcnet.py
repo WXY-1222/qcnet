@@ -92,6 +92,7 @@ class QCNet(pl.LightningModule):
                  topo_aux_gt_score_loss_weight: float = 0.0,
                  topo_aux_score_mix: float = 0.0,
                  topo_proposal_distill_only: bool = False,
+                 topo_motion_distill_only: bool = False,
                  decoder_type: str = 'qcnet',
                  distill_propose_weight: float = 0.0,
                  distill_refine_weight: float = 0.0,
@@ -156,6 +157,7 @@ class QCNet(pl.LightningModule):
         self.topo_aux_gt_score_loss_weight = topo_aux_gt_score_loss_weight
         self.topo_aux_score_mix = topo_aux_score_mix
         self.topo_proposal_distill_only = topo_proposal_distill_only
+        self.topo_motion_distill_only = topo_motion_distill_only
         self.decoder_type = decoder_type
         self.distill_propose_weight = distill_propose_weight
         self.distill_refine_weight = distill_refine_weight
@@ -256,6 +258,8 @@ class QCNet(pl.LightningModule):
             self._freeze_except_topo_aux_score()
         elif self.topo_proposal_distill_only:
             self._freeze_except_topo_proposal()
+        elif self.topo_motion_distill_only:
+            self._freeze_except_topo_motion()
         else:
             if self.use_teacher_proposals:
                 self._freeze_teacher_overridden_proposal()
@@ -292,6 +296,26 @@ class QCNet(pl.LightningModule):
         )
         for name, param in self.named_parameters():
             param.requires_grad_(name.startswith(proposal_prefixes))
+
+    def _freeze_except_topo_motion(self) -> None:
+        motion_prefixes = (
+            'decoder.mode_emb.',
+            'decoder.query_mlp.',
+            'decoder.to_goal.',
+            'decoder.to_corridor_goal_delta.',
+            'decoder.to_corridor_anchor_delta.',
+            'decoder.to_anchor_residual.',
+            'decoder.corridor_token_proj.',
+            'decoder.spatial_ssm.',
+            'decoder.to_loc_propose_pos.',
+            'decoder.to_scale_propose_pos.',
+            'decoder.rollout_token_proj.',
+            'decoder.temporal_ssm.',
+            'decoder.to_loc_refine_pos.',
+            'decoder.to_scale_refine_pos.',
+        )
+        for name, param in self.named_parameters():
+            param.requires_grad_(name.startswith(motion_prefixes))
 
     def _freeze_encoder(self) -> None:
         for param in self.encoder.parameters():
@@ -418,6 +442,15 @@ class QCNet(pl.LightningModule):
             if topo_corridor_loss is not None:
                 proposal_loss = proposal_loss + self.topo_corridor_loss_weight * topo_corridor_loss
             return proposal_loss
+        if self.topo_motion_distill_only:
+            motion_loss = reg_loss_propose + reg_loss_refine
+            if distill_losses:
+                motion_loss = motion_loss + self._distill_scale() * (
+                    self.distill_propose_weight * distill_losses.get('distill_propose_loss', 0.0) +
+                    self.distill_refine_weight * distill_losses.get('distill_refine_loss', 0.0))
+            if topo_corridor_loss is not None:
+                motion_loss = motion_loss + self.topo_corridor_loss_weight * topo_corridor_loss
+            return motion_loss
         loss = reg_loss_propose + reg_loss_refine + cls_loss
         if topo_corridor_loss is not None:
             loss = loss + self.topo_corridor_loss_weight * topo_corridor_loss
@@ -788,6 +821,7 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--topo_aux_gt_score_loss_weight', type=float, default=0.0)
         parser.add_argument('--topo_aux_score_mix', type=float, default=0.0)
         parser.add_argument('--topo_proposal_distill_only', action='store_true')
+        parser.add_argument('--topo_motion_distill_only', action='store_true')
         parser.add_argument('--decoder_type', type=str, default='qcnet', choices=['qcnet', 'topossm'])
         parser.add_argument('--distill_propose_weight', type=float, default=0.0)
         parser.add_argument('--distill_refine_weight', type=float, default=0.0)
