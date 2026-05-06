@@ -78,9 +78,11 @@ class TopoSSMDecoder(nn.Module):
         if topo_proposal_type not in (
                 'goal_mlp', 'mode_endpoint', 'corridor_mode_endpoint', 'corridor_goal', 'corridor_residual',
                 'corridor_query', 'corridor_query_safe', 'decomp_endpoint', 'decomp_endpoint_polyline',
-                'mode_endpoint_anchorbasis'):
+                'mode_endpoint_anchorbasis', 'mode_endpoint_polyline_readout'):
             raise ValueError(f'{topo_proposal_type} is not a valid topo_proposal_type')
-        if topo_proposal_type in ('decomp_endpoint', 'decomp_endpoint_polyline', 'mode_endpoint_anchorbasis') and output_dim != 2:
+        if topo_proposal_type in (
+                'decomp_endpoint', 'decomp_endpoint_polyline', 'mode_endpoint_anchorbasis',
+                'mode_endpoint_polyline_readout') and output_dim != 2:
             raise ValueError(f'{topo_proposal_type} currently requires output_dim == 2')
 
         self.mode_emb = nn.Embedding(num_modes, hidden_dim)
@@ -92,7 +94,9 @@ class TopoSSMDecoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.to_goal = MLPLayer(input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=output_dim)
-        if topo_proposal_type in ('mode_endpoint', 'corridor_mode_endpoint', 'mode_endpoint_anchorbasis'):
+        if topo_proposal_type in (
+                'mode_endpoint', 'corridor_mode_endpoint', 'mode_endpoint_anchorbasis',
+                'mode_endpoint_polyline_readout'):
             self.mode_endpoint_anchor = nn.Parameter(torch.zeros(num_modes, output_dim))
             self.to_mode_endpoint_delta = nn.Sequential(
                 nn.LayerNorm(hidden_dim * 2 + output_dim * 2),
@@ -103,6 +107,23 @@ class TopoSSMDecoder(nn.Module):
             )
         if topo_proposal_type == 'mode_endpoint_anchorbasis':
             self.mode_anchor_basis_offset = nn.Parameter(torch.zeros(num_modes, num_future_steps, 2))
+        if topo_proposal_type == 'mode_endpoint_polyline_readout':
+            self.num_polyline_control_points = 2
+            self.polyline_control_anchor = nn.Parameter(torch.zeros(num_modes, self.num_polyline_control_points, 2))
+            self.to_readout_goal_delta = nn.Sequential(
+                nn.LayerNorm(hidden_dim * 4 + output_dim * 2 + 2),
+                nn.Linear(hidden_dim * 4 + output_dim * 2 + 2, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+            )
+            self.to_readout_polyline_control = nn.Sequential(
+                nn.LayerNorm(hidden_dim * 4 + output_dim * 2 + 2 + self.num_polyline_control_points * 2),
+                nn.Linear(hidden_dim * 4 + output_dim * 2 + 2 + self.num_polyline_control_points * 2, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, self.num_polyline_control_points * 2),
+            )
         if topo_proposal_type in ('decomp_endpoint', 'decomp_endpoint_polyline'):
             self.endpoint_axis_anchor = nn.Parameter(torch.zeros(num_modes, 2))
             self.to_endpoint_axis = nn.Sequential(
@@ -198,12 +219,20 @@ class TopoSSMDecoder(nn.Module):
                 nn.Linear(hidden_dim, 1),
             )
         self.apply(weight_init)
-        if topo_proposal_type in ('mode_endpoint', 'corridor_mode_endpoint', 'mode_endpoint_anchorbasis'):
+        if topo_proposal_type in (
+                'mode_endpoint', 'corridor_mode_endpoint', 'mode_endpoint_anchorbasis',
+                'mode_endpoint_polyline_readout'):
             self._init_mode_endpoint_anchor()
             nn.init.zeros_(self.to_mode_endpoint_delta[-1].weight)
             nn.init.zeros_(self.to_mode_endpoint_delta[-1].bias)
         if topo_proposal_type == 'mode_endpoint_anchorbasis':
             nn.init.zeros_(self.mode_anchor_basis_offset)
+        if topo_proposal_type == 'mode_endpoint_polyline_readout':
+            self._init_readout_polyline_anchor()
+            nn.init.zeros_(self.to_readout_goal_delta[-1].weight)
+            nn.init.zeros_(self.to_readout_goal_delta[-1].bias)
+            nn.init.zeros_(self.to_readout_polyline_control[-1].weight)
+            nn.init.zeros_(self.to_readout_polyline_control[-1].bias)
         if topo_proposal_type in ('decomp_endpoint', 'decomp_endpoint_polyline'):
             self._init_decomp_endpoint_polyline_anchor()
             nn.init.zeros_(self.to_endpoint_axis[-1].weight)
@@ -268,6 +297,9 @@ class TopoSSMDecoder(nn.Module):
             anchor_residual = self.to_anchor_residual(mode_state).view(
                 -1, self.num_modes, self.num_future_steps, self.output_dim)
             anchor_local = anchor_base + anchor_residual
+        elif self.topo_proposal_type == 'mode_endpoint_polyline_readout':
+            goal_local, anchor_local = self._make_mode_endpoint_polyline_readout_proposals(
+                data, scene_enc, agent_state, mode_state)
         else:
             goal_local = self.to_goal(mode_state)
             anchor_base = self._make_goal_anchors(goal_local)
@@ -398,6 +430,13 @@ class TopoSSMDecoder(nn.Module):
             if self.output_dim > 1:
                 self.mode_endpoint_anchor[:, 1] = progress
 
+    def _init_readout_polyline_anchor(self) -> None:
+        with torch.no_grad():
+            progress = torch.linspace(-1.0, 1.0, self.num_modes, dtype=self.polyline_control_anchor.dtype)
+            self.polyline_control_anchor.zero_()
+            self.polyline_control_anchor[:, 0, 1] = 0.35 * progress
+            self.polyline_control_anchor[:, 1, 1] = 0.70 * progress
+
     def _init_decomp_endpoint_polyline_anchor(self) -> None:
         with torch.no_grad():
             progress = torch.linspace(-1.0, 1.0, self.num_modes, dtype=self.endpoint_axis_anchor.dtype)
@@ -419,6 +458,73 @@ class TopoSSMDecoder(nn.Module):
         endpoint_delta = mode_anchor + self.to_mode_endpoint_delta(delta_input)
         endpoint_delta = self.topo_mode_endpoint_scale * torch.tanh(endpoint_delta)
         return fallback_goal + endpoint_delta
+
+    def _make_mode_endpoint_polyline_readout_proposals(self,
+                                                       data: HeteroData,
+                                                       scene_enc: Mapping[str, torch.Tensor],
+                                                       agent_state: torch.Tensor,
+                                                       mode_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        base_goal = self._make_mode_endpoint_goals(agent_state, mode_state)
+        anchor_residual = self.to_anchor_residual(mode_state).view(
+            -1, self.num_modes, self.num_future_steps, self.output_dim)
+        rough_anchor = self._make_goal_anchors(base_goal) + anchor_residual
+
+        if data['map_polygon']['position'].numel() == 0:
+            return base_goal, rough_anchor
+
+        corridor_feat, corridor_dist, route_jump = self._extract_corridors(data, scene_enc, rough_anchor)
+        agent_tokens = agent_state.unsqueeze(1).expand(-1, self.num_modes, -1)
+        corridor_summary = corridor_feat.mean(dim=2)
+        endpoint_feat = corridor_feat[:, :, -1]
+        endpoint_dist = corridor_dist[:, :, -1:].to(dtype=mode_state.dtype)
+        endpoint_jump = route_jump[:, :, -1:].to(dtype=mode_state.dtype)
+        mode_anchor = self.mode_endpoint_anchor.unsqueeze(0).expand(mode_state.size(0), -1, -1)
+
+        goal_delta_input = torch.cat([
+            mode_state,
+            agent_tokens,
+            corridor_summary,
+            endpoint_feat,
+            base_goal,
+            mode_anchor,
+            endpoint_dist,
+            endpoint_jump,
+        ], dim=-1)
+        goal_delta = self.topo_goal_residual_scale * torch.tanh(self.to_readout_goal_delta(goal_delta_input))
+        blend = max(0.0, min(float(self.topo_goal_anchor_blend), 1.0))
+        goal_local = base_goal + blend * goal_delta
+
+        goal_dir, goal_ortho = self._build_goal_basis(goal_local)
+        control_anchor = self.polyline_control_anchor.unsqueeze(0).expand(mode_state.size(0), -1, -1, -1)
+        control_input = torch.cat([
+            mode_state,
+            agent_tokens,
+            corridor_summary,
+            endpoint_feat,
+            goal_local,
+            goal_delta,
+            endpoint_dist,
+            endpoint_jump,
+            control_anchor.reshape(mode_state.size(0), self.num_modes, -1),
+        ], dim=-1)
+        control_axis = control_anchor + self.to_readout_polyline_control(control_input).view(
+            mode_state.size(0), self.num_modes, self.num_polyline_control_points, 2)
+        control_axis = self.topo_polyline_control_scale * torch.tanh(control_axis)
+        control_delta = (
+            control_axis[..., :1] * goal_dir.unsqueeze(2) +
+            control_axis[..., 1:2] * goal_ortho.unsqueeze(2)
+        )
+        control_alpha = torch.linspace(
+            1.0 / (self.num_polyline_control_points + 1),
+            self.num_polyline_control_points / (self.num_polyline_control_points + 1),
+            self.num_polyline_control_points,
+            device=goal_local.device,
+            dtype=goal_local.dtype,
+        ).view(1, 1, -1, 1)
+        control_local = control_alpha * goal_local.unsqueeze(2) + control_delta
+        anchor_base = self._make_piecewise_polyline_anchors(goal_local, control_local)
+        anchor_local = anchor_base + anchor_residual
+        return goal_local, anchor_local
 
     def _make_decomp_endpoint_goals(self,
                                     agent_state: torch.Tensor,

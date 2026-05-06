@@ -979,7 +979,7 @@ class QCNet(pl.LightningModule):
                             choices=['goal_mlp', 'mode_endpoint', 'corridor_mode_endpoint', 'corridor_goal',
                                      'corridor_residual', 'corridor_query', 'corridor_query_safe',
                                      'decomp_endpoint', 'decomp_endpoint_polyline',
-                                     'mode_endpoint_anchorbasis'])
+                                     'mode_endpoint_anchorbasis', 'mode_endpoint_polyline_readout'])
         parser.add_argument('--topo_goal_distance_weight', type=float, default=0.05)
         parser.add_argument('--topo_goal_residual_scale', type=float, default=0.25)
         parser.add_argument('--topo_goal_anchor_blend', type=float, default=1.0)
