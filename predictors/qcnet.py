@@ -88,6 +88,8 @@ class QCNet(pl.LightningModule):
                  topo_mode_endpoint_scale: float = 0.08,
                  topo_anchor_basis_scale: float = 0.20,
                  topo_polyline_control_scale: float = 0.12,
+                 mamba_lr: float = 0.0,
+                 mamba_weight_decay: float = -1.0,
                  topo_endpoint_diversity_loss_weight: float = 0.0,
                  topo_endpoint_diversity_margin: float = 0.12,
                  topo_aux_score: bool = False,
@@ -159,6 +161,8 @@ class QCNet(pl.LightningModule):
         self.topo_mode_endpoint_scale = topo_mode_endpoint_scale
         self.topo_anchor_basis_scale = topo_anchor_basis_scale
         self.topo_polyline_control_scale = topo_polyline_control_scale
+        self.mamba_lr = mamba_lr
+        self.mamba_weight_decay = mamba_weight_decay
         self.topo_endpoint_diversity_loss_weight = topo_endpoint_diversity_loss_weight
         self.topo_endpoint_diversity_margin = topo_endpoint_diversity_margin
         self.topo_aux_score = topo_aux_score
@@ -698,6 +702,7 @@ class QCNet(pl.LightningModule):
     def configure_optimizers(self):
         decay = set()
         no_decay = set()
+        mamba_core = set()
         whitelist_weight_modules = (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.MultiheadAttention, nn.LSTM,
                                     nn.LSTMCell, nn.GRU, nn.GRUCell)
         blacklist_weight_modules = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.LayerNorm, nn.Embedding)
@@ -706,6 +711,9 @@ class QCNet(pl.LightningModule):
                 if not param.requires_grad:
                     continue
                 full_param_name = '%s.%s' % (module_name, param_name) if module_name else param_name
+                # Mamba core params respond better to a smaller LR and usually should not decay.
+                if '.fwd.' in full_param_name or '.bwd.' in full_param_name:
+                    mamba_core.add(full_param_name)
                 if 'bias' in param_name:
                     no_decay.add(full_param_name)
                 elif 'weight' in param_name:
@@ -721,12 +729,33 @@ class QCNet(pl.LightningModule):
         assert len(inter_params) == 0
         assert len(param_dict.keys() - union_params) == 0
 
-        optim_groups = [
-            {"params": [param_dict[param_name] for param_name in sorted(list(decay))],
-             "weight_decay": self.weight_decay},
-            {"params": [param_dict[param_name] for param_name in sorted(list(no_decay))],
-             "weight_decay": 0.0},
-        ]
+        def make_group(param_names, lr, weight_decay):
+            if not param_names:
+                return None
+            return {
+                "params": [param_dict[param_name] for param_name in sorted(param_names)],
+                "lr": lr,
+                "weight_decay": weight_decay,
+            }
+
+        if self.mamba_lr > 0.0:
+            base_decay = decay - mamba_core
+            base_no_decay = no_decay - mamba_core
+            mamba_decay = decay & mamba_core
+            mamba_no_decay = no_decay & mamba_core
+            mamba_wd = self.mamba_weight_decay if self.mamba_weight_decay >= 0.0 else 0.0
+            optim_groups = [
+                make_group(base_decay, self.lr, self.weight_decay),
+                make_group(base_no_decay, self.lr, 0.0),
+                make_group(mamba_decay, self.mamba_lr, mamba_wd),
+                make_group(mamba_no_decay, self.mamba_lr, 0.0),
+            ]
+            optim_groups = [group for group in optim_groups if group is not None]
+        else:
+            optim_groups = [
+                make_group(decay, self.lr, self.weight_decay),
+                make_group(no_decay, self.lr, 0.0),
+            ]
 
         optimizer = torch.optim.AdamW(optim_groups, lr=self.lr, weight_decay=self.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=self.T_max, eta_min=0.0)
@@ -910,6 +939,10 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--topo_mode_endpoint_scale', type=float, default=0.08)
         parser.add_argument('--topo_anchor_basis_scale', type=float, default=0.20)
         parser.add_argument('--topo_polyline_control_scale', type=float, default=0.12)
+        parser.add_argument('--mamba_lr', type=float, default=0.0,
+                            help='Optional lower learning rate for parameters inside BidirectionalMambaBlock.fwd/bwd.')
+        parser.add_argument('--mamba_weight_decay', type=float, default=-1.0,
+                            help='Optional weight decay for Mamba core params; negative means use zero decay.')
         parser.add_argument('--topo_endpoint_diversity_loss_weight', type=float, default=0.0)
         parser.add_argument('--topo_endpoint_diversity_margin', type=float, default=0.12)
         parser.add_argument('--topo_aux_score', action='store_true')
