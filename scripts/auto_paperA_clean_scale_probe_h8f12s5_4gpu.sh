@@ -17,6 +17,8 @@ GPU_IDS="${GPU_IDS:-4,5,6,7}"
 SEED="${SEED:-23}"
 RUN_TAG="${RUN_TAG:-20260507_paperA_clean_scale_probe}"
 MONITOR_INTERVAL_SEC="${MONITOR_INTERVAL_SEC:-180}"
+STALL_EPOCH_SEC="${STALL_EPOCH_SEC:-900}"
+STALL_LOG_SEC="${STALL_LOG_SEC:-900}"
 
 TOPO_MODE_ENDPOINT_SCALE="${TOPO_MODE_ENDPOINT_SCALE:-0.16}"
 TOPO_CORRIDOR_LOSS_WEIGHT="${TOPO_CORRIDOR_LOSS_WEIGHT:-0.02}"
@@ -46,6 +48,85 @@ ulimit -n 65535 2>/dev/null || true
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+file_mtime_or_zero() {
+  local path="$1"
+  if [[ -e "${path}" ]]; then
+    stat -c %Y "${path}"
+  else
+    echo 0
+  fi
+}
+
+kill_run_tree() {
+  local root_pid="$1"
+  local reason="$2"
+  log "Stopping run tree for PID ${root_pid}: ${reason}"
+  kill -TERM -- "-${root_pid}" 2>/dev/null || true
+  sleep 5
+  kill -KILL -- "-${root_pid}" 2>/dev/null || true
+}
+
+monitor_run() {
+  local pid="$1"
+  local ckpt_dir="$2"
+  local run_log="$3"
+  local last_epoch_seen=""
+  local last_epoch_change_ts
+  last_epoch_change_ts="$(date +%s)"
+
+  while true; do
+    sleep "${MONITOR_INTERVAL_SEC}"
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      log "Monitor noticed PID ${pid} has exited"
+      break
+    fi
+
+    local now_ts metrics latest_epoch latest_ade best_ade best_path log_mtime log_silence_sec epoch_stall_sec
+    now_ts="$(date +%s)"
+    if ! metrics="$(metric_json "${ckpt_dir}")"; then
+      log "Monitor warning: failed to read checkpoint metrics from ${ckpt_dir}"
+      continue
+    fi
+    latest_epoch="$(json_value "${metrics}" latest_epoch)"
+    latest_ade="$(json_value "${metrics}" latest_ade)"
+    best_ade="$(json_value "${metrics}" best_ade)"
+    best_path="$(json_value "${metrics}" best_path)"
+    log "latest_epoch=${latest_epoch:-na} latest_ade=${latest_ade:-na} best_ade=${best_ade:-na} best_path=${best_path:-na}"
+
+    if [[ -n "${latest_epoch}" && "${latest_epoch}" != "${last_epoch_seen}" ]]; then
+      last_epoch_seen="${latest_epoch}"
+      last_epoch_change_ts="${now_ts}"
+    fi
+    if [[ -n "${best_ade}" ]] && float_le "${best_ade}" "${TARGET_ADE}"; then
+      log "Positive signal: best_ade=${best_ade} <= ${TARGET_ADE}"
+    fi
+
+    log_mtime="$(file_mtime_or_zero "${run_log}")"
+    log_silence_sec="$(( now_ts - log_mtime ))"
+    epoch_stall_sec="$(( now_ts - last_epoch_change_ts ))"
+    if (( log_silence_sec >= STALL_LOG_SEC )); then
+      kill_run_tree "${pid}" "run log silent for ${log_silence_sec}s"
+      break
+    fi
+    if [[ -n "${last_epoch_seen}" ]] && (( epoch_stall_sec >= STALL_EPOCH_SEC )); then
+      kill_run_tree "${pid}" "latest_epoch=${last_epoch_seen} stalled for ${epoch_stall_sec}s"
+      break
+    fi
+    if [[ -n "${latest_epoch}" && -n "${best_ade}" ]]; then
+      if (( latest_epoch >= 4 )) && float_gt "${best_ade}" "${STOP_IF_BEST_GT_E4}"; then
+        log "Early stop: best_ade=${best_ade} is still above ${STOP_IF_BEST_GT_E4} at epoch ${latest_epoch}"
+        kill_run_tree "${pid}" "failed epoch-4 threshold"
+        break
+      fi
+      if (( latest_epoch >= 8 )) && float_gt "${best_ade}" "${STOP_IF_BEST_GT_E8}"; then
+        log "Early stop: best_ade=${best_ade} is still above ${STOP_IF_BEST_GT_E8} at epoch ${latest_epoch}"
+        kill_run_tree "${pid}" "failed epoch-8 threshold"
+        break
+      fi
+    fi
+  done
 }
 
 metric_json() {
@@ -118,7 +199,7 @@ log "save_root=${SAVE_ROOT}"
 log "run_log=${RUN_LOG}"
 log "config=from_scratch proposal=mode_endpoint scale=${TOPO_MODE_ENDPOINT_SCALE} lr=${LR} epochs=${MAX_EPOCHS}"
 
-"${PYTHON_BIN}" train_qcnet.py \
+setsid "${PYTHON_BIN}" train_qcnet.py \
   --dataset interaction_digir \
   --interaction_data_path "${DATA_ROOT}/${DATA_FILE}" \
   --save_root "${SAVE_ROOT}" \
@@ -164,32 +245,11 @@ log "config=from_scratch proposal=mode_endpoint scale=${TOPO_MODE_ENDPOINT_SCALE
 
 pid="$!"
 log "train PID ${pid}"
-
-while kill -0 "${pid}" 2>/dev/null; do
-  sleep "${MONITOR_INTERVAL_SEC}"
-  metrics="$(metric_json "${CKPT_DIR}")"
-  latest_epoch="$(json_value "${metrics}" latest_epoch)"
-  latest_ade="$(json_value "${metrics}" latest_ade)"
-  best_ade="$(json_value "${metrics}" best_ade)"
-  best_path="$(json_value "${metrics}" best_path)"
-  log "latest_epoch=${latest_epoch:-na} latest_ade=${latest_ade:-na} best_ade=${best_ade:-na} best_path=${best_path:-na}"
-  if [[ -n "${best_ade}" ]] && float_le "${best_ade}" "${TARGET_ADE}"; then
-    log "Positive signal: best_ade=${best_ade} <= ${TARGET_ADE}"
-  fi
-  if [[ -n "${latest_epoch}" && -n "${best_ade}" ]]; then
-    if (( latest_epoch >= 4 )) && float_gt "${best_ade}" "${STOP_IF_BEST_GT_E4}"; then
-      log "Early stop: best_ade=${best_ade} is still above ${STOP_IF_BEST_GT_E4} at epoch ${latest_epoch}"
-      kill "${pid}" 2>/dev/null || true
-      break
-    fi
-    if (( latest_epoch >= 8 )) && float_gt "${best_ade}" "${STOP_IF_BEST_GT_E8}"; then
-      log "Early stop: best_ade=${best_ade} is still above ${STOP_IF_BEST_GT_E8} at epoch ${latest_epoch}"
-      kill "${pid}" 2>/dev/null || true
-      break
-    fi
-  fi
-done
+monitor_run "${pid}" "${CKPT_DIR}" "${RUN_LOG}" &
+monitor_pid="$!"
 
 wait "${pid}" || true
+kill "${monitor_pid}" 2>/dev/null || true
+wait "${monitor_pid}" 2>/dev/null || true
 metrics="$(metric_json "${CKPT_DIR}")"
 log "Finished metrics=${metrics}"
