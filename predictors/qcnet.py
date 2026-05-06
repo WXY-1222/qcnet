@@ -90,6 +90,9 @@ class QCNet(pl.LightningModule):
                  topo_polyline_control_scale: float = 0.12,
                  mamba_lr: float = 0.0,
                  mamba_weight_decay: float = -1.0,
+                 aux_goal_loss_weight: float = 0.0,
+                 aux_goal_loss_weight_decay: float = 0.0,
+                 aux_goal_warmup_epochs: int = 0,
                  topo_endpoint_diversity_loss_weight: float = 0.0,
                  topo_endpoint_diversity_margin: float = 0.12,
                  topo_aux_score: bool = False,
@@ -163,6 +166,9 @@ class QCNet(pl.LightningModule):
         self.topo_polyline_control_scale = topo_polyline_control_scale
         self.mamba_lr = mamba_lr
         self.mamba_weight_decay = mamba_weight_decay
+        self.aux_goal_loss_weight = aux_goal_loss_weight
+        self.aux_goal_loss_weight_decay = aux_goal_loss_weight_decay
+        self.aux_goal_warmup_epochs = aux_goal_warmup_epochs
         self.topo_endpoint_diversity_loss_weight = topo_endpoint_diversity_loss_weight
         self.topo_endpoint_diversity_margin = topo_endpoint_diversity_margin
         self.topo_aux_score = topo_aux_score
@@ -427,6 +433,11 @@ class QCNet(pl.LightningModule):
             pred=pred,
             best_mode=best_mode,
             cls_mask=cls_mask)
+        aux_goal_loss = self._matched_mode_aux_goal_loss(
+            pred=pred,
+            target=gt[..., :self.output_dim],
+            best_mode=best_mode,
+            cls_mask=cls_mask)
         distill_losses = self._teacher_distill_losses(
             data=data,
             pred=pred,
@@ -448,6 +459,10 @@ class QCNet(pl.LightningModule):
         if topo_endpoint_diversity_loss is not None:
             self.log('train_topo_endpoint_diversity_loss', topo_endpoint_diversity_loss, prog_bar=False, on_step=True,
                      on_epoch=True, batch_size=1)
+        if aux_goal_loss is not None:
+            self.log('train_aux_goal_loss', aux_goal_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+            self.log('train_aux_goal_weight', float(self._aux_goal_loss_scale()), prog_bar=False, on_step=True,
+                     on_epoch=False, batch_size=1)
         topo_aux_gt_score_loss = None
         if 'topo_aux_pi' in pred:
             topo_aux_gt_score_loss = F.cross_entropy(pred['topo_aux_pi'], best_mode.detach(), reduction='none')
@@ -482,6 +497,8 @@ class QCNet(pl.LightningModule):
                 proposal_loss = proposal_loss + self.topo_corridor_loss_weight * topo_corridor_loss
             if topo_endpoint_diversity_loss is not None:
                 proposal_loss = proposal_loss + self.topo_endpoint_diversity_loss_weight * topo_endpoint_diversity_loss
+            if aux_goal_loss is not None:
+                proposal_loss = proposal_loss + self._aux_goal_loss_scale() * aux_goal_loss
             return proposal_loss
         if self.topo_motion_distill_only:
             motion_loss = reg_loss_propose + reg_loss_refine
@@ -493,6 +510,8 @@ class QCNet(pl.LightningModule):
                 motion_loss = motion_loss + self.topo_corridor_loss_weight * topo_corridor_loss
             if topo_endpoint_diversity_loss is not None:
                 motion_loss = motion_loss + self.topo_endpoint_diversity_loss_weight * topo_endpoint_diversity_loss
+            if aux_goal_loss is not None:
+                motion_loss = motion_loss + self._aux_goal_loss_scale() * aux_goal_loss
             return motion_loss
         loss = reg_loss_propose + reg_loss_refine + cls_loss
         if topo_corridor_loss is not None:
@@ -505,6 +524,8 @@ class QCNet(pl.LightningModule):
             loss = loss + self.topo_aux_gt_score_loss_weight * topo_aux_gt_score_loss
         if topo_endpoint_diversity_loss is not None:
             loss = loss + self.topo_endpoint_diversity_loss_weight * topo_endpoint_diversity_loss
+        if aux_goal_loss is not None:
+            loss = loss + self._aux_goal_loss_scale() * aux_goal_loss
         distill_scale = self._distill_scale()
         if distill_losses:
             loss = loss + distill_scale * (
@@ -689,6 +710,32 @@ class QCNet(pl.LightningModule):
 
         diversity_loss = 0.5 * (repel_best + pair_loss)
         return (diversity_loss * valid).sum() / valid_den
+
+    def _aux_goal_loss_scale(self) -> float:
+        if self.aux_goal_loss_weight <= 0.0 or self.aux_goal_warmup_epochs <= 0:
+            return 0.0
+        if int(self.current_epoch) >= int(self.aux_goal_warmup_epochs):
+            return 0.0
+        weight = float(self.aux_goal_loss_weight) - float(self.current_epoch) * float(self.aux_goal_loss_weight_decay)
+        return max(weight, 0.0)
+
+    def _matched_mode_aux_goal_loss(self,
+                                    pred,
+                                    target: torch.Tensor,
+                                    best_mode: torch.Tensor,
+                                    cls_mask: torch.Tensor):
+        if self._aux_goal_loss_scale() <= 0.0:
+            return None
+        if 'loc_propose_pos' not in pred:
+            return None
+
+        pred_endpoint = pred['loc_propose_pos'][:, :, -1, :self.output_dim]
+        batch_idx = torch.arange(pred_endpoint.size(0), device=pred_endpoint.device)
+        matched_endpoint = pred_endpoint[batch_idx, best_mode]
+        target_endpoint = target[:, -1]
+        endpoint_loss = F.smooth_l1_loss(matched_endpoint, target_endpoint, reduction='none').sum(dim=-1)
+        valid = cls_mask.to(dtype=endpoint_loss.dtype)
+        return (endpoint_loss * valid).sum() / valid.sum().clamp(min=1.0)
 
     def on_test_end(self):
         if self.dataset == 'argoverse_v2':
@@ -943,6 +990,12 @@ class QCNet(pl.LightningModule):
                             help='Optional lower learning rate for parameters inside BidirectionalMambaBlock.fwd/bwd.')
         parser.add_argument('--mamba_weight_decay', type=float, default=-1.0,
                             help='Optional weight decay for Mamba core params; negative means use zero decay.')
+        parser.add_argument('--aux_goal_loss_weight', type=float, default=0.0,
+                            help='Warmup-only matched-mode endpoint loss weight on proposal endpoints.')
+        parser.add_argument('--aux_goal_loss_weight_decay', type=float, default=0.0,
+                            help='Per-epoch decay for the warmup-only matched-mode endpoint loss.')
+        parser.add_argument('--aux_goal_warmup_epochs', type=int, default=0,
+                            help='Number of early epochs where the matched-mode endpoint aux loss is active.')
         parser.add_argument('--topo_endpoint_diversity_loss_weight', type=float, default=0.0)
         parser.add_argument('--topo_endpoint_diversity_margin', type=float, default=0.12)
         parser.add_argument('--topo_aux_score', action='store_true')
