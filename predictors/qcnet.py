@@ -86,6 +86,7 @@ class QCNet(pl.LightningModule):
                  topo_goal_residual_scale: float = 0.25,
                  topo_goal_anchor_blend: float = 1.0,
                  topo_mode_endpoint_scale: float = 0.08,
+                 topo_polyline_control_scale: float = 0.12,
                  topo_endpoint_diversity_loss_weight: float = 0.0,
                  topo_endpoint_diversity_margin: float = 0.12,
                  topo_aux_score: bool = False,
@@ -155,6 +156,7 @@ class QCNet(pl.LightningModule):
         self.topo_goal_residual_scale = topo_goal_residual_scale
         self.topo_goal_anchor_blend = topo_goal_anchor_blend
         self.topo_mode_endpoint_scale = topo_mode_endpoint_scale
+        self.topo_polyline_control_scale = topo_polyline_control_scale
         self.topo_endpoint_diversity_loss_weight = topo_endpoint_diversity_loss_weight
         self.topo_endpoint_diversity_margin = topo_endpoint_diversity_margin
         self.topo_aux_score = topo_aux_score
@@ -244,6 +246,7 @@ class QCNet(pl.LightningModule):
                 topo_goal_residual_scale=topo_goal_residual_scale,
                 topo_goal_anchor_blend=topo_goal_anchor_blend,
                 topo_mode_endpoint_scale=topo_mode_endpoint_scale,
+                topo_polyline_control_scale=topo_polyline_control_scale,
                 topo_aux_score=topo_aux_score,
                 topo_aux_score_detach=topo_aux_score_detach,
             )
@@ -892,11 +895,13 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--topo_score_temperature', type=float, default=0.2)
         parser.add_argument('--topo_proposal_type', type=str, default='goal_mlp',
                             choices=['goal_mlp', 'mode_endpoint', 'corridor_mode_endpoint', 'corridor_goal',
-                                     'corridor_residual', 'corridor_query', 'corridor_query_safe'])
+                                     'corridor_residual', 'corridor_query', 'corridor_query_safe',
+                                     'decomp_endpoint', 'decomp_endpoint_polyline'])
         parser.add_argument('--topo_goal_distance_weight', type=float, default=0.05)
         parser.add_argument('--topo_goal_residual_scale', type=float, default=0.25)
         parser.add_argument('--topo_goal_anchor_blend', type=float, default=1.0)
         parser.add_argument('--topo_mode_endpoint_scale', type=float, default=0.08)
+        parser.add_argument('--topo_polyline_control_scale', type=float, default=0.12)
         parser.add_argument('--topo_endpoint_diversity_loss_weight', type=float, default=0.0)
         parser.add_argument('--topo_endpoint_diversity_margin', type=float, default=0.12)
         parser.add_argument('--topo_aux_score', action='store_true')
