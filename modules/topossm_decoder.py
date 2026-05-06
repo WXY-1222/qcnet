@@ -52,6 +52,7 @@ class TopoSSMDecoder(nn.Module):
                  topo_goal_residual_scale: float = 0.25,
                  topo_goal_anchor_blend: float = 1.0,
                  topo_mode_endpoint_scale: float = 0.08,
+                 topo_anchor_basis_scale: float = 0.20,
                  topo_polyline_control_scale: float = 0.12,
                  topo_aux_score: bool = False,
                  topo_aux_score_detach: bool = True,
@@ -69,15 +70,17 @@ class TopoSSMDecoder(nn.Module):
         self.topo_goal_residual_scale = topo_goal_residual_scale
         self.topo_goal_anchor_blend = topo_goal_anchor_blend
         self.topo_mode_endpoint_scale = topo_mode_endpoint_scale
+        self.topo_anchor_basis_scale = topo_anchor_basis_scale
         self.topo_polyline_control_scale = topo_polyline_control_scale
         self.topo_aux_score = topo_aux_score
         self.topo_aux_score_detach = topo_aux_score_detach
         self.corridor_dist_norm = corridor_dist_norm
         if topo_proposal_type not in (
                 'goal_mlp', 'mode_endpoint', 'corridor_mode_endpoint', 'corridor_goal', 'corridor_residual',
-                'corridor_query', 'corridor_query_safe', 'decomp_endpoint', 'decomp_endpoint_polyline'):
+                'corridor_query', 'corridor_query_safe', 'decomp_endpoint', 'decomp_endpoint_polyline',
+                'mode_endpoint_anchorbasis'):
             raise ValueError(f'{topo_proposal_type} is not a valid topo_proposal_type')
-        if topo_proposal_type in ('decomp_endpoint', 'decomp_endpoint_polyline') and output_dim != 2:
+        if topo_proposal_type in ('decomp_endpoint', 'decomp_endpoint_polyline', 'mode_endpoint_anchorbasis') and output_dim != 2:
             raise ValueError(f'{topo_proposal_type} currently requires output_dim == 2')
 
         self.mode_emb = nn.Embedding(num_modes, hidden_dim)
@@ -89,7 +92,7 @@ class TopoSSMDecoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.to_goal = MLPLayer(input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=output_dim)
-        if topo_proposal_type in ('mode_endpoint', 'corridor_mode_endpoint'):
+        if topo_proposal_type in ('mode_endpoint', 'corridor_mode_endpoint', 'mode_endpoint_anchorbasis'):
             self.mode_endpoint_anchor = nn.Parameter(torch.zeros(num_modes, output_dim))
             self.to_mode_endpoint_delta = nn.Sequential(
                 nn.LayerNorm(hidden_dim * 2 + output_dim * 2),
@@ -98,6 +101,8 @@ class TopoSSMDecoder(nn.Module):
                 nn.Dropout(dropout),
                 nn.Linear(hidden_dim, output_dim),
             )
+        if topo_proposal_type == 'mode_endpoint_anchorbasis':
+            self.mode_anchor_basis_offset = nn.Parameter(torch.zeros(num_modes, num_future_steps, 2))
         if topo_proposal_type in ('decomp_endpoint', 'decomp_endpoint_polyline'):
             self.endpoint_axis_anchor = nn.Parameter(torch.zeros(num_modes, 2))
             self.to_endpoint_axis = nn.Sequential(
@@ -193,10 +198,12 @@ class TopoSSMDecoder(nn.Module):
                 nn.Linear(hidden_dim, 1),
             )
         self.apply(weight_init)
-        if topo_proposal_type in ('mode_endpoint', 'corridor_mode_endpoint'):
+        if topo_proposal_type in ('mode_endpoint', 'corridor_mode_endpoint', 'mode_endpoint_anchorbasis'):
             self._init_mode_endpoint_anchor()
             nn.init.zeros_(self.to_mode_endpoint_delta[-1].weight)
             nn.init.zeros_(self.to_mode_endpoint_delta[-1].bias)
+        if topo_proposal_type == 'mode_endpoint_anchorbasis':
+            nn.init.zeros_(self.mode_anchor_basis_offset)
         if topo_proposal_type in ('decomp_endpoint', 'decomp_endpoint_polyline'):
             self._init_decomp_endpoint_polyline_anchor()
             nn.init.zeros_(self.to_endpoint_axis[-1].weight)
@@ -252,6 +259,12 @@ class TopoSSMDecoder(nn.Module):
         elif self.topo_proposal_type == 'mode_endpoint':
             goal_local = self._make_mode_endpoint_goals(agent_state, mode_state)
             anchor_base = self._make_goal_anchors(goal_local)
+            anchor_residual = self.to_anchor_residual(mode_state).view(
+                -1, self.num_modes, self.num_future_steps, self.output_dim)
+            anchor_local = anchor_base + anchor_residual
+        elif self.topo_proposal_type == 'mode_endpoint_anchorbasis':
+            goal_local = self._make_mode_endpoint_goals(agent_state, mode_state)
+            anchor_base = self._make_mode_endpoint_basis_anchors(goal_local)
             anchor_residual = self.to_anchor_residual(mode_state).view(
                 -1, self.num_modes, self.num_future_steps, self.output_dim)
             anchor_local = anchor_base + anchor_residual
@@ -353,6 +366,29 @@ class TopoSSMDecoder(nn.Module):
             dtype=goal_local.dtype,
         )
         return goal_local.unsqueeze(2) * alpha.view(1, 1, self.num_future_steps, 1)
+
+    def _make_mode_endpoint_basis_anchors(self, goal_local: torch.Tensor) -> torch.Tensor:
+        goal_dir, goal_ortho = self._build_goal_basis(goal_local)
+        goal_norm = goal_local.norm(dim=-1, keepdim=True).clamp_min(1e-3)
+        alpha = torch.linspace(
+            1.0 / self.num_future_steps,
+            1.0,
+            self.num_future_steps,
+            device=goal_local.device,
+            dtype=goal_local.dtype,
+        ).view(1, 1, self.num_future_steps, 1)
+        coeff = goal_local.new_zeros((1, self.num_modes, self.num_future_steps, 2))
+        coeff[..., 0:1] = alpha
+        basis_offset = self.topo_anchor_basis_scale * torch.tanh(
+            self.mode_anchor_basis_offset.to(device=goal_local.device, dtype=goal_local.dtype)
+        ).unsqueeze(0)
+        basis_offset = basis_offset.clone()
+        basis_offset[..., -1, :] = 0.0
+        coeff = coeff + basis_offset
+        return goal_norm.unsqueeze(2) * (
+            coeff[..., 0:1] * goal_dir.unsqueeze(2) +
+            coeff[..., 1:2] * goal_ortho.unsqueeze(2)
+        )
 
     def _init_mode_endpoint_anchor(self) -> None:
         with torch.no_grad():
