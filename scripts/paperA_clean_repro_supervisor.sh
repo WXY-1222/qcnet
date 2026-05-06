@@ -41,6 +41,8 @@ export SEEDS
 export BASELINE_ADE
 export TARGET_ADE
 
-"${SCRIPT_DIR}/auto_topossm_decoder_paper_ablation_A_mode_endpoint_noscore_h8f12s5_4gpu.sh"
+# Run through bash so the supervisor does not depend on executable bits
+# surviving server-side sync/reset flows.
+bash "${SCRIPT_DIR}/auto_topossm_decoder_paper_ablation_A_mode_endpoint_noscore_h8f12s5_4gpu.sh"
 
 log "PaperA clean repro supervisor finished"
