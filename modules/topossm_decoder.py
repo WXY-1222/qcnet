@@ -785,7 +785,9 @@ class TopoSSMDecoder(nn.Module):
                                             scene_enc: Mapping[str, torch.Tensor],
                                             agent_state: torch.Tensor,
                                             mode_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        base_goal, fallback_anchor = self._make_mode_endpoint_polyline_lite_proposals(agent_state, mode_state)
+        base_goal = self._make_mode_endpoint_goals(agent_state, mode_state)
+        fallback_anchor = self._make_goal_anchors(base_goal) + self.to_anchor_residual(mode_state).view(
+            -1, self.num_modes, self.num_future_steps, self.output_dim)
         device = mode_state.device
         dtype = mode_state.dtype
         map_pos = data['map_polygon']['position'][:, :2].to(device=device, dtype=dtype)
