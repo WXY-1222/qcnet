@@ -57,6 +57,7 @@ class TopoSSMDecoder(nn.Module):
                  topo_route_slot_longitudinal_scale: float = 0.20,
                  topo_route_slot_lateral_scale: float = 0.12,
                  topo_route_slot_topk: int = 12,
+                 topo_route_slot_soft_temperature: float = 0.35,
                  topo_aux_score: bool = False,
                  topo_aux_score_detach: bool = True,
                  corridor_dist_norm: float = 50.0) -> None:
@@ -78,6 +79,7 @@ class TopoSSMDecoder(nn.Module):
         self.topo_route_slot_longitudinal_scale = topo_route_slot_longitudinal_scale
         self.topo_route_slot_lateral_scale = topo_route_slot_lateral_scale
         self.topo_route_slot_topk = topo_route_slot_topk
+        self.topo_route_slot_soft_temperature = topo_route_slot_soft_temperature
         self.topo_aux_score = topo_aux_score
         self.topo_aux_score_detach = topo_aux_score_detach
         self.corridor_dist_norm = corridor_dist_norm
@@ -85,12 +87,12 @@ class TopoSSMDecoder(nn.Module):
                 'goal_mlp', 'mode_endpoint', 'corridor_mode_endpoint', 'corridor_goal', 'corridor_residual',
                 'corridor_query', 'corridor_query_safe', 'decomp_endpoint', 'decomp_endpoint_polyline',
                 'mode_endpoint_anchorbasis', 'mode_endpoint_polyline_readout', 'mode_endpoint_polyline_lite',
-                'corridor_multi_anchor', 'route_slot_polyline'):
+                'corridor_multi_anchor', 'route_slot_polyline', 'soft_route_slot_polyline'):
             raise ValueError(f'{topo_proposal_type} is not a valid topo_proposal_type')
         if topo_proposal_type in (
                 'decomp_endpoint', 'decomp_endpoint_polyline', 'mode_endpoint_anchorbasis',
                 'mode_endpoint_polyline_readout', 'mode_endpoint_polyline_lite', 'corridor_multi_anchor',
-                'route_slot_polyline') and output_dim != 2:
+                'route_slot_polyline', 'soft_route_slot_polyline') and output_dim != 2:
             raise ValueError(f'{topo_proposal_type} currently requires output_dim == 2')
 
         self.mode_emb = nn.Embedding(num_modes, hidden_dim)
@@ -105,7 +107,7 @@ class TopoSSMDecoder(nn.Module):
         if topo_proposal_type in (
                 'mode_endpoint', 'corridor_mode_endpoint', 'mode_endpoint_anchorbasis',
                 'mode_endpoint_polyline_readout', 'mode_endpoint_polyline_lite', 'corridor_multi_anchor',
-                'route_slot_polyline'):
+                'route_slot_polyline', 'soft_route_slot_polyline'):
             self.mode_endpoint_anchor = nn.Parameter(torch.zeros(num_modes, output_dim))
             self.to_mode_endpoint_delta = nn.Sequential(
                 nn.LayerNorm(hidden_dim * 2 + output_dim * 2),
@@ -160,7 +162,7 @@ class TopoSSMDecoder(nn.Module):
                 nn.Dropout(dropout),
                 nn.Linear(hidden_dim, self.num_polyline_control_points * 2),
             )
-        if topo_proposal_type == 'route_slot_polyline':
+        if topo_proposal_type in ('route_slot_polyline', 'soft_route_slot_polyline'):
             self.num_polyline_control_points = 1
             self.route_slot_axis_anchor = nn.Parameter(torch.zeros(num_modes, 2))
             self.polyline_control_anchor = nn.Parameter(torch.zeros(num_modes, self.num_polyline_control_points, 2))
@@ -276,7 +278,7 @@ class TopoSSMDecoder(nn.Module):
         if topo_proposal_type in (
                 'mode_endpoint', 'corridor_mode_endpoint', 'mode_endpoint_anchorbasis',
                 'mode_endpoint_polyline_readout', 'mode_endpoint_polyline_lite', 'corridor_multi_anchor',
-                'route_slot_polyline'):
+                'route_slot_polyline', 'soft_route_slot_polyline'):
             self._init_mode_endpoint_anchor()
             nn.init.zeros_(self.to_mode_endpoint_delta[-1].weight)
             nn.init.zeros_(self.to_mode_endpoint_delta[-1].bias)
@@ -298,7 +300,7 @@ class TopoSSMDecoder(nn.Module):
             nn.init.zeros_(self.to_corridor_multi_goal_delta[-1].bias)
             nn.init.zeros_(self.to_corridor_multi_control[-1].weight)
             nn.init.zeros_(self.to_corridor_multi_control[-1].bias)
-        if topo_proposal_type == 'route_slot_polyline':
+        if topo_proposal_type in ('route_slot_polyline', 'soft_route_slot_polyline'):
             self._init_route_slot_axis_anchor()
             self._init_lite_polyline_anchor()
             nn.init.zeros_(self.to_route_slot_axis[-1].weight)
@@ -379,6 +381,9 @@ class TopoSSMDecoder(nn.Module):
                 data, scene_enc, agent_state, mode_state)
         elif self.topo_proposal_type == 'route_slot_polyline':
             goal_local, anchor_local = self._make_route_slot_polyline_proposals(
+                data, scene_enc, agent_state, mode_state)
+        elif self.topo_proposal_type == 'soft_route_slot_polyline':
+            goal_local, anchor_local = self._make_soft_route_slot_polyline_proposals(
                 data, scene_enc, agent_state, mode_state)
         else:
             goal_local = self.to_goal(mode_state)
@@ -837,6 +842,63 @@ class TopoSSMDecoder(nn.Module):
             )
         return goal_local, anchor_local
 
+    def _make_soft_route_slot_polyline_proposals(self,
+                                                 data: HeteroData,
+                                                 scene_enc: Mapping[str, torch.Tensor],
+                                                 agent_state: torch.Tensor,
+                                                 mode_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        base_goal = self._make_mode_endpoint_goals(agent_state, mode_state)
+        fallback_anchor = self._make_goal_anchors(base_goal) + self.to_anchor_residual(mode_state).view(
+            -1, self.num_modes, self.num_future_steps, self.output_dim)
+        device = mode_state.device
+        dtype = mode_state.dtype
+        map_pos = data['map_polygon']['position'][:, :2].to(device=device, dtype=dtype)
+        if map_pos.numel() == 0:
+            return base_goal, fallback_anchor
+
+        map_feat = scene_enc['x_pl'][:, -1].to(device=device, dtype=dtype)
+        agent_origin = data['agent']['position'][:, self.num_historical_steps - 1].to(device=device, dtype=dtype)
+        agent_heading = data['agent']['heading'][:, self.num_historical_steps - 1].to(device=device, dtype=dtype)
+        goal_local = base_goal.new_empty(base_goal.shape)
+        anchor_local = fallback_anchor.new_empty(fallback_anchor.shape)
+
+        if isinstance(data, Batch):
+            agent_batch = data['agent']['batch'].to(device=device)
+            map_batch = data['map_polygon']['batch'].to(device=device)
+            for batch_id in torch.unique(agent_batch, sorted=True):
+                agent_idx = torch.nonzero(agent_batch == batch_id, as_tuple=False).flatten()
+                map_idx = torch.nonzero(map_batch == batch_id, as_tuple=False).flatten()
+                if agent_idx.numel() == 0:
+                    continue
+                if map_idx.numel() == 0:
+                    goal_local[agent_idx] = base_goal[agent_idx]
+                    anchor_local[agent_idx] = fallback_anchor[agent_idx]
+                    continue
+                goal_part, anchor_part = self._select_soft_route_slot_for_agents(
+                    mode_state[agent_idx],
+                    agent_state[agent_idx],
+                    base_goal[agent_idx],
+                    fallback_anchor[agent_idx],
+                    agent_origin[agent_idx],
+                    agent_heading[agent_idx],
+                    map_pos[map_idx],
+                    map_feat[map_idx],
+                )
+                goal_local[agent_idx] = goal_part
+                anchor_local[agent_idx] = anchor_part
+        else:
+            goal_local, anchor_local = self._select_soft_route_slot_for_agents(
+                mode_state,
+                agent_state,
+                base_goal,
+                fallback_anchor,
+                agent_origin,
+                agent_heading,
+                map_pos,
+                map_feat,
+            )
+        return goal_local, anchor_local
+
     def _select_route_slot_for_agents(self,
                                       mode_state: torch.Tensor,
                                       agent_state: torch.Tensor,
@@ -877,6 +939,84 @@ class TopoSSMDecoder(nn.Module):
             index=best_rank.unsqueeze(-1).expand(-1, -1, 1, self.output_dim),
         ).squeeze(2)
         slot_feat = map_feat[slot_idx]
+
+        agent_tokens = agent_state.unsqueeze(1).expand(-1, self.num_modes, -1)
+        axis_anchor = self.route_slot_axis_anchor.unsqueeze(0).expand(num_agents, -1, -1)
+        axis_input = torch.cat([mode_state, agent_tokens, slot_feat, slot_local, base_goal, axis_anchor], dim=-1)
+        axis_coeff = axis_anchor + self.to_route_slot_axis(axis_input)
+        axis_coeff = torch.tanh(axis_coeff)
+        slot_dir, slot_ortho = self._build_goal_basis(slot_local)
+        slot_blend = max(0.0, min(float(self.topo_goal_anchor_blend), 1.0))
+        slot_center = slot_blend * slot_local + (1.0 - slot_blend) * base_goal
+        axis_delta = (
+            self.topo_route_slot_longitudinal_scale * axis_coeff[..., :1] * slot_dir +
+            self.topo_route_slot_lateral_scale * axis_coeff[..., 1:2] * slot_ortho
+        )
+        goal_local = slot_center + axis_delta
+
+        control_anchor = self.polyline_control_anchor.unsqueeze(0).expand(num_agents, -1, -1, -1)
+        control_input = torch.cat([
+            mode_state,
+            agent_tokens,
+            slot_feat,
+            goal_local,
+            slot_local,
+            axis_coeff,
+            control_anchor.reshape(num_agents, self.num_modes, -1),
+        ], dim=-1)
+        control_axis = control_anchor + self.to_route_slot_control(control_input).view(
+            num_agents, self.num_modes, self.num_polyline_control_points, 2)
+        control_axis = self.topo_polyline_control_scale * torch.tanh(control_axis)
+        control_delta = (
+            control_axis[..., :1] * slot_dir.unsqueeze(2) +
+            control_axis[..., 1:2] * slot_ortho.unsqueeze(2)
+        )
+        control_center = 0.5 * slot_center
+        control_local = control_center.unsqueeze(2) + control_delta
+
+        anchor_base = self._make_piecewise_polyline_anchors(goal_local, control_local)
+        anchor_residual = self.to_anchor_residual(mode_state).view(
+            -1, self.num_modes, self.num_future_steps, self.output_dim)
+        anchor_local = anchor_base + anchor_residual
+        return goal_local, anchor_local
+
+    def _select_soft_route_slot_for_agents(self,
+                                           mode_state: torch.Tensor,
+                                           agent_state: torch.Tensor,
+                                           base_goal: torch.Tensor,
+                                           fallback_anchor: torch.Tensor,
+                                           agent_origin: torch.Tensor,
+                                           agent_heading: torch.Tensor,
+                                           map_pos: torch.Tensor,
+                                           map_feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_agents = mode_state.size(0)
+        base_global = self._local_to_global(base_goal.unsqueeze(2), agent_origin[:, :2], agent_heading).squeeze(2)
+        distance = torch.cdist(base_global.reshape(-1, self.output_dim), map_pos).reshape(
+            num_agents, self.num_modes, -1)
+        topk = min(max(self.num_modes * 2, int(self.topo_route_slot_topk)), distance.size(-1))
+        nearest_dist, nearest_idx = distance.topk(k=topk, dim=-1, largest=False)
+
+        query_score_all = torch.einsum('nkh,mh->nkm', mode_state, map_feat) / math.sqrt(self.hidden_dim)
+        query_score = query_score_all.gather(dim=-1, index=nearest_idx)
+        candidate_global = map_pos[nearest_idx.reshape(-1)].view(num_agents, self.num_modes, topk, self.output_dim)
+        candidate_local = self._global_to_local(
+            candidate_global.reshape(-1, self.output_dim),
+            agent_origin[:, None, None, :2].expand(-1, self.num_modes, topk, -1).reshape(-1, self.output_dim),
+            agent_heading[:, None, None].expand(-1, self.num_modes, topk).reshape(-1),
+        ).view(num_agents, self.num_modes, topk, self.output_dim)
+        candidate_feat = map_feat[nearest_idx.reshape(-1)].view(num_agents, self.num_modes, topk, self.hidden_dim)
+        forward_score = candidate_local[..., 0] / self.corridor_dist_norm
+        lateral_penalty = candidate_local[..., 1].abs() / self.corridor_dist_norm
+        local_score = (
+            query_score
+            - self.topo_goal_distance_weight * nearest_dist / self.corridor_dist_norm
+            + 0.05 * forward_score
+            - 0.02 * lateral_penalty
+        )
+        temperature = max(float(self.topo_route_slot_soft_temperature), 1e-3)
+        slot_weight = torch.softmax(local_score / temperature, dim=-1)
+        slot_local = (slot_weight.unsqueeze(-1) * candidate_local).sum(dim=2)
+        slot_feat = (slot_weight.unsqueeze(-1) * candidate_feat).sum(dim=2)
 
         agent_tokens = agent_state.unsqueeze(1).expand(-1, self.num_modes, -1)
         axis_anchor = self.route_slot_axis_anchor.unsqueeze(0).expand(num_agents, -1, -1)

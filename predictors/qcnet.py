@@ -91,6 +91,7 @@ class QCNet(pl.LightningModule):
                  topo_route_slot_longitudinal_scale: float = 0.20,
                  topo_route_slot_lateral_scale: float = 0.12,
                  topo_route_slot_topk: int = 12,
+                 topo_route_slot_soft_temperature: float = 0.35,
                  mamba_lr: float = 0.0,
                  mamba_weight_decay: float = -1.0,
                  aux_goal_loss_weight: float = 0.0,
@@ -171,6 +172,7 @@ class QCNet(pl.LightningModule):
         self.topo_route_slot_longitudinal_scale = topo_route_slot_longitudinal_scale
         self.topo_route_slot_lateral_scale = topo_route_slot_lateral_scale
         self.topo_route_slot_topk = topo_route_slot_topk
+        self.topo_route_slot_soft_temperature = topo_route_slot_soft_temperature
         self.mamba_lr = mamba_lr
         self.mamba_weight_decay = mamba_weight_decay
         self.aux_goal_loss_weight = aux_goal_loss_weight
@@ -271,6 +273,7 @@ class QCNet(pl.LightningModule):
                 topo_route_slot_longitudinal_scale=topo_route_slot_longitudinal_scale,
                 topo_route_slot_lateral_scale=topo_route_slot_lateral_scale,
                 topo_route_slot_topk=topo_route_slot_topk,
+                topo_route_slot_soft_temperature=topo_route_slot_soft_temperature,
                 topo_aux_score=topo_aux_score,
                 topo_aux_score_detach=topo_aux_score_detach,
             )
@@ -1017,7 +1020,7 @@ class QCNet(pl.LightningModule):
                                      'decomp_endpoint', 'decomp_endpoint_polyline',
                                      'mode_endpoint_anchorbasis', 'mode_endpoint_polyline_readout',
                                      'mode_endpoint_polyline_lite', 'corridor_multi_anchor',
-                                     'route_slot_polyline'])
+                                     'route_slot_polyline', 'soft_route_slot_polyline'])
         parser.add_argument('--topo_goal_distance_weight', type=float, default=0.05)
         parser.add_argument('--topo_goal_residual_scale', type=float, default=0.25)
         parser.add_argument('--topo_goal_anchor_blend', type=float, default=1.0)
@@ -1027,6 +1030,7 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--topo_route_slot_longitudinal_scale', type=float, default=0.20)
         parser.add_argument('--topo_route_slot_lateral_scale', type=float, default=0.12)
         parser.add_argument('--topo_route_slot_topk', type=int, default=12)
+        parser.add_argument('--topo_route_slot_soft_temperature', type=float, default=0.35)
         parser.add_argument('--mamba_lr', type=float, default=0.0,
                             help='Optional lower learning rate for parameters inside BidirectionalMambaBlock.fwd/bwd.')
         parser.add_argument('--mamba_weight_decay', type=float, default=-1.0,
