@@ -104,7 +104,8 @@ class TopoSSMDecoder(nn.Module):
         self.to_goal = MLPLayer(input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=output_dim)
         if topo_proposal_type in (
                 'mode_endpoint', 'corridor_mode_endpoint', 'mode_endpoint_anchorbasis',
-                'mode_endpoint_polyline_readout', 'mode_endpoint_polyline_lite', 'corridor_multi_anchor'):
+                'mode_endpoint_polyline_readout', 'mode_endpoint_polyline_lite', 'corridor_multi_anchor',
+                'route_slot_polyline'):
             self.mode_endpoint_anchor = nn.Parameter(torch.zeros(num_modes, output_dim))
             self.to_mode_endpoint_delta = nn.Sequential(
                 nn.LayerNorm(hidden_dim * 2 + output_dim * 2),
@@ -274,7 +275,8 @@ class TopoSSMDecoder(nn.Module):
         self.apply(weight_init)
         if topo_proposal_type in (
                 'mode_endpoint', 'corridor_mode_endpoint', 'mode_endpoint_anchorbasis',
-                'mode_endpoint_polyline_readout', 'mode_endpoint_polyline_lite', 'corridor_multi_anchor'):
+                'mode_endpoint_polyline_readout', 'mode_endpoint_polyline_lite', 'corridor_multi_anchor',
+                'route_slot_polyline'):
             self._init_mode_endpoint_anchor()
             nn.init.zeros_(self.to_mode_endpoint_delta[-1].weight)
             nn.init.zeros_(self.to_mode_endpoint_delta[-1].bias)
