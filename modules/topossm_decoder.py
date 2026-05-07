@@ -87,12 +87,13 @@ class TopoSSMDecoder(nn.Module):
                 'goal_mlp', 'mode_endpoint', 'corridor_mode_endpoint', 'corridor_goal', 'corridor_residual',
                 'corridor_query', 'corridor_query_safe', 'decomp_endpoint', 'decomp_endpoint_polyline',
                 'mode_endpoint_anchorbasis', 'mode_endpoint_polyline_readout', 'mode_endpoint_polyline_lite',
-                'corridor_multi_anchor', 'route_slot_polyline', 'soft_route_slot_polyline'):
+                'corridor_multi_anchor', 'route_slot_polyline', 'soft_route_slot_polyline',
+                'interaction_decomp_endpoint'):
             raise ValueError(f'{topo_proposal_type} is not a valid topo_proposal_type')
         if topo_proposal_type in (
                 'decomp_endpoint', 'decomp_endpoint_polyline', 'mode_endpoint_anchorbasis',
                 'mode_endpoint_polyline_readout', 'mode_endpoint_polyline_lite', 'corridor_multi_anchor',
-                'route_slot_polyline', 'soft_route_slot_polyline') and output_dim != 2:
+                'route_slot_polyline', 'soft_route_slot_polyline', 'interaction_decomp_endpoint') and output_dim != 2:
             raise ValueError(f'{topo_proposal_type} currently requires output_dim == 2')
 
         self.mode_emb = nn.Embedding(num_modes, hidden_dim)
@@ -185,6 +186,22 @@ class TopoSSMDecoder(nn.Module):
             self.to_endpoint_axis = nn.Sequential(
                 nn.LayerNorm(hidden_dim * 2 + output_dim + 2),
                 nn.Linear(hidden_dim * 2 + output_dim + 2, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 2),
+            )
+        if topo_proposal_type == 'interaction_decomp_endpoint':
+            self.interaction_axis_anchor = nn.Parameter(torch.zeros(num_modes, 2))
+            self.to_interaction_context = nn.Sequential(
+                nn.LayerNorm(hidden_dim + 3),
+                nn.Linear(hidden_dim + 3, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.to_interaction_axis = nn.Sequential(
+                nn.LayerNorm(hidden_dim * 3 + output_dim + 2),
+                nn.Linear(hidden_dim * 3 + output_dim + 2, hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_dim, 2),
@@ -311,6 +328,10 @@ class TopoSSMDecoder(nn.Module):
             self._init_decomp_endpoint_polyline_anchor()
             nn.init.zeros_(self.to_endpoint_axis[-1].weight)
             nn.init.zeros_(self.to_endpoint_axis[-1].bias)
+        if topo_proposal_type == 'interaction_decomp_endpoint':
+            self._init_interaction_axis_anchor()
+            nn.init.zeros_(self.to_interaction_axis[-1].weight)
+            nn.init.zeros_(self.to_interaction_axis[-1].bias)
         if topo_proposal_type == 'decomp_endpoint_polyline':
             nn.init.zeros_(self.to_polyline_control[-1].weight)
             nn.init.zeros_(self.to_polyline_control[-1].bias)
@@ -353,6 +374,12 @@ class TopoSSMDecoder(nn.Module):
                 data, scene_enc, agent_state, mode_state)
         elif self.topo_proposal_type == 'decomp_endpoint':
             goal_local = self._make_decomp_endpoint_goals(agent_state, mode_state)
+            anchor_base = self._make_goal_anchors(goal_local)
+            anchor_residual = self.to_anchor_residual(mode_state).view(
+                -1, self.num_modes, self.num_future_steps, self.output_dim)
+            anchor_local = anchor_base + anchor_residual
+        elif self.topo_proposal_type == 'interaction_decomp_endpoint':
+            goal_local = self._make_interaction_decomp_endpoint_goals(data, scene_enc, agent_state, mode_state)
             anchor_base = self._make_goal_anchors(goal_local)
             anchor_residual = self.to_anchor_residual(mode_state).view(
                 -1, self.num_modes, self.num_future_steps, self.output_dim)
@@ -545,6 +572,13 @@ class TopoSSMDecoder(nn.Module):
                 self.polyline_control_anchor.zero_()
                 self.polyline_control_anchor[:, 0, 1] = 0.5 * progress
                 self.polyline_control_anchor[:, 1, 1] = progress
+
+    def _init_interaction_axis_anchor(self) -> None:
+        with torch.no_grad():
+            progress = torch.linspace(-1.0, 1.0, self.num_modes, dtype=self.interaction_axis_anchor.dtype)
+            self.interaction_axis_anchor.zero_()
+            self.interaction_axis_anchor[:, 0] = 0.20 * progress
+            self.interaction_axis_anchor[:, 1] = 0.80 * progress
 
     def _make_mode_endpoint_goals(self,
                                   agent_state: torch.Tensor,
@@ -1070,6 +1104,22 @@ class TopoSSMDecoder(nn.Module):
         fallback_dir, fallback_ortho = self._build_goal_basis(fallback_goal)
         return fallback_goal + self._compose_axis_delta(endpoint_axis, fallback_dir, fallback_ortho)
 
+    def _make_interaction_decomp_endpoint_goals(self,
+                                                data: HeteroData,
+                                                scene_enc: Mapping[str, torch.Tensor],
+                                                agent_state: torch.Tensor,
+                                                mode_state: torch.Tensor) -> torch.Tensor:
+        fallback_goal = self.to_goal(mode_state)
+        agent_tokens = agent_state.unsqueeze(1).expand(-1, self.num_modes, -1)
+        interaction_context = self._extract_interaction_context(data, scene_enc).unsqueeze(1).expand(
+            -1, self.num_modes, -1)
+        axis_anchor = self.interaction_axis_anchor.unsqueeze(0).expand(mode_state.size(0), -1, -1)
+        axis_input = torch.cat([mode_state, agent_tokens, interaction_context, fallback_goal, axis_anchor], dim=-1)
+        endpoint_axis = axis_anchor + self.to_interaction_axis(axis_input)
+        endpoint_axis = self.topo_mode_endpoint_scale * torch.tanh(endpoint_axis)
+        fallback_dir, fallback_ortho = self._build_goal_basis(fallback_goal)
+        return fallback_goal + self._compose_axis_delta(endpoint_axis, fallback_dir, fallback_ortho)
+
     def _make_decomp_endpoint_polyline_proposals(self,
                                                  agent_state: torch.Tensor,
                                                  mode_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1117,6 +1167,61 @@ class TopoSSMDecoder(nn.Module):
         goal_dir = torch.where(goal_norm > 1e-3, goal_local / goal_norm.clamp_min(1e-3), default_dir)
         goal_ortho = torch.stack([-goal_dir[..., 1], goal_dir[..., 0]], dim=-1)
         return goal_dir, goal_ortho
+
+    def _extract_interaction_context(self,
+                                     data: HeteroData,
+                                     scene_enc: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        agent_feat = scene_enc['x_a'][:, -1]
+        device = agent_feat.device
+        dtype = agent_feat.dtype
+        pos = data['agent']['position'][:, self.num_historical_steps - 1, :2].to(device=device, dtype=dtype)
+        heading = data['agent']['heading'][:, self.num_historical_steps - 1].to(device=device, dtype=dtype)
+        context = agent_feat.new_zeros(agent_feat.shape)
+
+        if isinstance(data, Batch):
+            agent_batch = data['agent']['batch'].to(device=device)
+            for batch_id in torch.unique(agent_batch, sorted=True):
+                agent_idx = torch.nonzero(agent_batch == batch_id, as_tuple=False).flatten()
+                if agent_idx.numel() <= 1:
+                    continue
+                context[agent_idx] = self._pool_interaction_neighbors(
+                    pos[agent_idx], heading[agent_idx], agent_feat[agent_idx])
+        else:
+            if pos.size(0) > 1:
+                context = self._pool_interaction_neighbors(pos, heading, agent_feat)
+        return context
+
+    def _pool_interaction_neighbors(self,
+                                    pos: torch.Tensor,
+                                    heading: torch.Tensor,
+                                    feat: torch.Tensor) -> torch.Tensor:
+        num_agents = pos.size(0)
+        if num_agents <= 1:
+            return feat.new_zeros(feat.shape)
+
+        rel = pos.unsqueeze(1) - pos.unsqueeze(0)
+        dist = rel.norm(dim=-1)
+        dist = dist + torch.eye(num_agents, device=pos.device, dtype=pos.dtype) * 1e6
+        k = min(8, num_agents - 1)
+        nearest_dist, nearest_idx = dist.topk(k=k, dim=-1, largest=False)
+        neigh_feat = feat[nearest_idx]
+        neigh_rel = rel.gather(dim=1, index=nearest_idx.unsqueeze(-1).expand(-1, -1, 2))
+
+        cos = heading.cos().unsqueeze(-1)
+        sin = heading.sin().unsqueeze(-1)
+        rel_x = neigh_rel[..., 0]
+        rel_y = neigh_rel[..., 1]
+        local_x = rel_x * cos + rel_y * sin
+        local_y = -rel_x * sin + rel_y * cos
+        neigh_local = torch.stack([local_x, local_y], dim=-1)
+        neigh_input = torch.cat([
+            neigh_feat,
+            neigh_local,
+            nearest_dist.unsqueeze(-1) / self.corridor_dist_norm,
+        ], dim=-1)
+        neigh_token = self.to_interaction_context(neigh_input)
+        neigh_weight = torch.softmax(-nearest_dist / 10.0, dim=-1)
+        return (neigh_weight.unsqueeze(-1) * neigh_token).sum(dim=1)
 
     def _compose_axis_delta(self,
                             axis_coeff: torch.Tensor,
