@@ -88,6 +88,9 @@ class QCNet(pl.LightningModule):
                  topo_mode_endpoint_scale: float = 0.08,
                  topo_anchor_basis_scale: float = 0.20,
                  topo_polyline_control_scale: float = 0.12,
+                 topo_route_slot_longitudinal_scale: float = 0.20,
+                 topo_route_slot_lateral_scale: float = 0.12,
+                 topo_route_slot_topk: int = 12,
                  mamba_lr: float = 0.0,
                  mamba_weight_decay: float = -1.0,
                  aux_goal_loss_weight: float = 0.0,
@@ -103,6 +106,7 @@ class QCNet(pl.LightningModule):
                  topo_aux_score_mix: float = 0.0,
                  topo_proposal_distill_only: bool = False,
                  topo_motion_distill_only: bool = False,
+                 topo_partial_keep_encoder: bool = False,
                  decoder_type: str = 'qcnet',
                  distill_propose_weight: float = 0.0,
                  distill_refine_weight: float = 0.0,
@@ -164,6 +168,9 @@ class QCNet(pl.LightningModule):
         self.topo_mode_endpoint_scale = topo_mode_endpoint_scale
         self.topo_anchor_basis_scale = topo_anchor_basis_scale
         self.topo_polyline_control_scale = topo_polyline_control_scale
+        self.topo_route_slot_longitudinal_scale = topo_route_slot_longitudinal_scale
+        self.topo_route_slot_lateral_scale = topo_route_slot_lateral_scale
+        self.topo_route_slot_topk = topo_route_slot_topk
         self.mamba_lr = mamba_lr
         self.mamba_weight_decay = mamba_weight_decay
         self.aux_goal_loss_weight = aux_goal_loss_weight
@@ -179,6 +186,7 @@ class QCNet(pl.LightningModule):
         self.topo_aux_score_mix = topo_aux_score_mix
         self.topo_proposal_distill_only = topo_proposal_distill_only
         self.topo_motion_distill_only = topo_motion_distill_only
+        self.topo_partial_keep_encoder = topo_partial_keep_encoder
         self.decoder_type = decoder_type
         self.distill_propose_weight = distill_propose_weight
         self.distill_refine_weight = distill_refine_weight
@@ -260,6 +268,9 @@ class QCNet(pl.LightningModule):
                 topo_mode_endpoint_scale=topo_mode_endpoint_scale,
                 topo_anchor_basis_scale=topo_anchor_basis_scale,
                 topo_polyline_control_scale=topo_polyline_control_scale,
+                topo_route_slot_longitudinal_scale=topo_route_slot_longitudinal_scale,
+                topo_route_slot_lateral_scale=topo_route_slot_lateral_scale,
+                topo_route_slot_topk=topo_route_slot_topk,
                 topo_aux_score=topo_aux_score,
                 topo_aux_score_detach=topo_aux_score_detach,
             )
@@ -312,11 +323,22 @@ class QCNet(pl.LightningModule):
             'decoder.query_mlp.',
             'decoder.to_goal.',
             'decoder.mode_endpoint_anchor',
+            'decoder.polyline_control_anchor',
+            'decoder.route_slot_axis_anchor',
             'decoder.to_mode_endpoint_delta.',
             'decoder.to_corridor_mode_endpoint_delta.',
             'decoder.to_corridor_goal_delta.',
             'decoder.to_corridor_anchor_delta.',
+            'decoder.to_corridor_multi_goal_delta.',
+            'decoder.to_corridor_multi_control.',
+            'decoder.to_route_slot_axis.',
+            'decoder.to_route_slot_control.',
             'decoder.to_anchor_residual.',
+            'decoder.to_polyline_control_lite.',
+            'decoder.to_readout_goal_delta.',
+            'decoder.to_readout_polyline_control.',
+            'decoder.to_endpoint_axis.',
+            'decoder.to_polyline_control.',
             'decoder.corridor_token_proj.',
             'decoder.spatial_ssm.',
             'decoder.to_loc_propose_pos.',
@@ -324,6 +346,9 @@ class QCNet(pl.LightningModule):
         )
         for name, param in self.named_parameters():
             param.requires_grad_(name.startswith(proposal_prefixes))
+        if self.topo_partial_keep_encoder:
+            for param in self.encoder.parameters():
+                param.requires_grad_(True)
 
     def _freeze_except_topo_motion(self) -> None:
         motion_prefixes = (
@@ -331,11 +356,19 @@ class QCNet(pl.LightningModule):
             'decoder.query_mlp.',
             'decoder.to_goal.',
             'decoder.mode_endpoint_anchor',
+            'decoder.polyline_control_anchor',
             'decoder.to_mode_endpoint_delta.',
             'decoder.to_corridor_mode_endpoint_delta.',
             'decoder.to_corridor_goal_delta.',
             'decoder.to_corridor_anchor_delta.',
+            'decoder.to_corridor_multi_goal_delta.',
+            'decoder.to_corridor_multi_control.',
             'decoder.to_anchor_residual.',
+            'decoder.to_polyline_control_lite.',
+            'decoder.to_readout_goal_delta.',
+            'decoder.to_readout_polyline_control.',
+            'decoder.to_endpoint_axis.',
+            'decoder.to_polyline_control.',
             'decoder.corridor_token_proj.',
             'decoder.spatial_ssm.',
             'decoder.to_loc_propose_pos.',
@@ -347,6 +380,9 @@ class QCNet(pl.LightningModule):
         )
         for name, param in self.named_parameters():
             param.requires_grad_(name.startswith(motion_prefixes))
+        if self.topo_partial_keep_encoder:
+            for param in self.encoder.parameters():
+                param.requires_grad_(True)
 
     def _freeze_encoder(self) -> None:
         for param in self.encoder.parameters():
@@ -980,13 +1016,17 @@ class QCNet(pl.LightningModule):
                                      'corridor_residual', 'corridor_query', 'corridor_query_safe',
                                      'decomp_endpoint', 'decomp_endpoint_polyline',
                                      'mode_endpoint_anchorbasis', 'mode_endpoint_polyline_readout',
-                                     'mode_endpoint_polyline_lite'])
+                                     'mode_endpoint_polyline_lite', 'corridor_multi_anchor',
+                                     'route_slot_polyline'])
         parser.add_argument('--topo_goal_distance_weight', type=float, default=0.05)
         parser.add_argument('--topo_goal_residual_scale', type=float, default=0.25)
         parser.add_argument('--topo_goal_anchor_blend', type=float, default=1.0)
         parser.add_argument('--topo_mode_endpoint_scale', type=float, default=0.08)
         parser.add_argument('--topo_anchor_basis_scale', type=float, default=0.20)
         parser.add_argument('--topo_polyline_control_scale', type=float, default=0.12)
+        parser.add_argument('--topo_route_slot_longitudinal_scale', type=float, default=0.20)
+        parser.add_argument('--topo_route_slot_lateral_scale', type=float, default=0.12)
+        parser.add_argument('--topo_route_slot_topk', type=int, default=12)
         parser.add_argument('--mamba_lr', type=float, default=0.0,
                             help='Optional lower learning rate for parameters inside BidirectionalMambaBlock.fwd/bwd.')
         parser.add_argument('--mamba_weight_decay', type=float, default=-1.0,
@@ -1007,6 +1047,8 @@ class QCNet(pl.LightningModule):
         parser.add_argument('--topo_aux_score_mix', type=float, default=0.0)
         parser.add_argument('--topo_proposal_distill_only', action='store_true')
         parser.add_argument('--topo_motion_distill_only', action='store_true')
+        parser.add_argument('--topo_partial_keep_encoder', action='store_true',
+                            help='Keep encoder trainable when using partial TopoSSM freeze modes.')
         parser.add_argument('--decoder_type', type=str, default='qcnet', choices=['qcnet', 'topossm'])
         parser.add_argument('--distill_propose_weight', type=float, default=0.0)
         parser.add_argument('--distill_refine_weight', type=float, default=0.0)
