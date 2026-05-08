@@ -68,6 +68,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_by_location', action='store_true')
     parser.add_argument('--location_batch_seed', type=int, default=None)
     parser.add_argument('--ddp_even_strategy', type=str, default='drop', choices=['drop', 'pad'])
+    parser.add_argument('--ddp_find_unused_parameters', type=_str2bool, default=False)
     parser.add_argument('--allow_test_as_val', action='store_true')
     parser.add_argument('--require_test_split', action='store_true')
     parser.add_argument('--accelerator', type=str, default='auto')
@@ -153,7 +154,7 @@ if __name__ == '__main__':
     trainer_kwargs = dict(
         accelerator=args.accelerator,
         devices=args.devices,
-        strategy=DDPStrategy(find_unused_parameters=False, gradient_as_bucket_view=True),
+        strategy=DDPStrategy(find_unused_parameters=args.ddp_find_unused_parameters, gradient_as_bucket_view=True),
         callbacks=[model_checkpoint, lr_monitor],
         max_epochs=args.max_epochs,
         check_val_every_n_epoch=args.check_val_every_n_epoch,

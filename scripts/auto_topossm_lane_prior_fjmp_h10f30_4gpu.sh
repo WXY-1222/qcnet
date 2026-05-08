@@ -153,6 +153,7 @@ setsid "${PYTHON_BIN}" train_qcnet.py \
   --monitor_mode min \
   --devices 4 \
   --accelerator gpu \
+  --ddp_find_unused_parameters true \
   --num_historical_steps 10 \
   --num_future_steps 30 \
   --num_recurrent_steps 3 \
