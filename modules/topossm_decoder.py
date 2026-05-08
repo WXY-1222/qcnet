@@ -88,12 +88,13 @@ class TopoSSMDecoder(nn.Module):
                 'corridor_query', 'corridor_query_safe', 'decomp_endpoint', 'decomp_endpoint_polyline',
                 'mode_endpoint_anchorbasis', 'mode_endpoint_polyline_readout', 'mode_endpoint_polyline_lite',
                 'corridor_multi_anchor', 'route_slot_polyline', 'soft_route_slot_polyline',
-                'interaction_decomp_endpoint'):
+                'interaction_decomp_endpoint', 'interaction_cv_endpoint'):
             raise ValueError(f'{topo_proposal_type} is not a valid topo_proposal_type')
         if topo_proposal_type in (
                 'decomp_endpoint', 'decomp_endpoint_polyline', 'mode_endpoint_anchorbasis',
                 'mode_endpoint_polyline_readout', 'mode_endpoint_polyline_lite', 'corridor_multi_anchor',
-                'route_slot_polyline', 'soft_route_slot_polyline', 'interaction_decomp_endpoint') and output_dim != 2:
+                'route_slot_polyline', 'soft_route_slot_polyline', 'interaction_decomp_endpoint',
+                'interaction_cv_endpoint') and output_dim != 2:
             raise ValueError(f'{topo_proposal_type} currently requires output_dim == 2')
 
         self.mode_emb = nn.Embedding(num_modes, hidden_dim)
@@ -190,7 +191,7 @@ class TopoSSMDecoder(nn.Module):
                 nn.Dropout(dropout),
                 nn.Linear(hidden_dim, 2),
             )
-        if topo_proposal_type == 'interaction_decomp_endpoint':
+        if topo_proposal_type in ('interaction_decomp_endpoint', 'interaction_cv_endpoint'):
             self.interaction_axis_anchor = nn.Parameter(torch.zeros(num_modes, 2))
             self.to_interaction_context = nn.Sequential(
                 nn.LayerNorm(hidden_dim + 3),
@@ -328,7 +329,7 @@ class TopoSSMDecoder(nn.Module):
             self._init_decomp_endpoint_polyline_anchor()
             nn.init.zeros_(self.to_endpoint_axis[-1].weight)
             nn.init.zeros_(self.to_endpoint_axis[-1].bias)
-        if topo_proposal_type == 'interaction_decomp_endpoint':
+        if topo_proposal_type in ('interaction_decomp_endpoint', 'interaction_cv_endpoint'):
             self._init_interaction_axis_anchor()
             nn.init.zeros_(self.to_interaction_axis[-1].weight)
             nn.init.zeros_(self.to_interaction_axis[-1].bias)
@@ -384,6 +385,9 @@ class TopoSSMDecoder(nn.Module):
             anchor_residual = self.to_anchor_residual(mode_state).view(
                 -1, self.num_modes, self.num_future_steps, self.output_dim)
             anchor_local = anchor_base + anchor_residual
+        elif self.topo_proposal_type == 'interaction_cv_endpoint':
+            goal_local, anchor_local = self._make_interaction_cv_endpoint_proposals(
+                data, scene_enc, agent_state, mode_state)
         elif self.topo_proposal_type == 'decomp_endpoint_polyline':
             goal_local, anchor_local = self._make_decomp_endpoint_polyline_proposals(agent_state, mode_state)
         elif self.topo_proposal_type == 'mode_endpoint':
@@ -1119,6 +1123,62 @@ class TopoSSMDecoder(nn.Module):
         endpoint_axis = self.topo_mode_endpoint_scale * torch.tanh(endpoint_axis)
         fallback_dir, fallback_ortho = self._build_goal_basis(fallback_goal)
         return fallback_goal + self._compose_axis_delta(endpoint_axis, fallback_dir, fallback_ortho)
+
+    def _make_interaction_cv_endpoint_proposals(self,
+                                                data: HeteroData,
+                                                scene_enc: Mapping[str, torch.Tensor],
+                                                agent_state: torch.Tensor,
+                                                mode_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        cv_anchor = self._make_cv_anchors(data, mode_state.device, mode_state.dtype)
+        cv_goal = cv_anchor[:, -1].unsqueeze(1).expand(-1, self.num_modes, -1)
+        agent_tokens = agent_state.unsqueeze(1).expand(-1, self.num_modes, -1)
+        interaction_context = self._extract_interaction_context(data, scene_enc).unsqueeze(1).expand(
+            -1, self.num_modes, -1)
+        axis_anchor = self.interaction_axis_anchor.unsqueeze(0).expand(mode_state.size(0), -1, -1)
+        axis_input = torch.cat([mode_state, agent_tokens, interaction_context, cv_goal, axis_anchor], dim=-1)
+        endpoint_axis = axis_anchor + self.to_interaction_axis(axis_input)
+        endpoint_axis = self.topo_mode_endpoint_scale * torch.tanh(endpoint_axis)
+        cv_dir, cv_ortho = self._build_goal_basis(cv_goal)
+        endpoint_delta = self._compose_axis_delta(endpoint_axis, cv_dir, cv_ortho)
+        goal_local = cv_goal + endpoint_delta
+
+        anchor_base = cv_anchor.unsqueeze(1) + self._make_goal_anchors(endpoint_delta)
+        anchor_residual = self.to_anchor_residual(mode_state).view(
+            -1, self.num_modes, self.num_future_steps, self.output_dim)
+        anchor_local = anchor_base + 0.25 * anchor_residual
+        return goal_local, anchor_local
+
+    def _make_cv_anchors(self,
+                         data: HeteroData,
+                         device: torch.device,
+                         dtype: torch.dtype) -> torch.Tensor:
+        pos = data['agent']['position'][:, :self.num_historical_steps, :2].to(device=device, dtype=dtype)
+        valid = data['agent']['valid_mask'][:, :self.num_historical_steps].to(device=device)
+        num_hist = pos.size(1)
+        if num_hist <= 1:
+            vel_global = pos.new_zeros((pos.size(0), 2))
+        else:
+            window = min(3, num_hist - 1)
+            curr = pos[:, num_hist - window:num_hist]
+            prev = pos[:, num_hist - window - 1:num_hist - 1]
+            pair_valid = valid[:, num_hist - window:num_hist] & valid[:, num_hist - window - 1:num_hist - 1]
+            pair_valid_f = pair_valid.to(dtype=dtype).unsqueeze(-1)
+            vel_global = ((curr - prev) * pair_valid_f).sum(dim=1)
+            vel_global = vel_global / pair_valid_f.sum(dim=1).clamp_min(1.0)
+
+        heading = data['agent']['heading'][:, self.num_historical_steps - 1].to(device=device, dtype=dtype)
+        cos, sin = heading.cos(), heading.sin()
+        vel_local = torch.stack([
+            vel_global[:, 0] * cos + vel_global[:, 1] * sin,
+            -vel_global[:, 0] * sin + vel_global[:, 1] * cos,
+        ], dim=-1)
+        steps = torch.arange(
+            1,
+            self.num_future_steps + 1,
+            device=device,
+            dtype=dtype,
+        ).view(1, self.num_future_steps, 1)
+        return vel_local.unsqueeze(1) * steps
 
     def _make_decomp_endpoint_polyline_proposals(self,
                                                  agent_state: torch.Tensor,
