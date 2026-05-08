@@ -186,8 +186,8 @@ class TopoSSMDecoder(nn.Module):
         if topo_proposal_type == 'lane_prior_anchor':
             self.lane_prior_axis_anchor = nn.Parameter(torch.zeros(num_modes, 2))
             self.to_lane_prior_axis = nn.Sequential(
-                nn.LayerNorm(hidden_dim * 3 + output_dim * 3 + 2),
-                nn.Linear(hidden_dim * 3 + output_dim * 3 + 2, hidden_dim),
+                nn.LayerNorm(hidden_dim * 3 + output_dim * 3),
+                nn.Linear(hidden_dim * 3 + output_dim * 3, hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_dim, 2),
