@@ -19,11 +19,14 @@ TRAIN_BS="${TRAIN_BS:-4}"
 EVAL_BS="${EVAL_BS:-8}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 EVAL_BATCHES="${EVAL_BATCHES:-0}"
+PIN_MEMORY="${PIN_MEMORY:-true}"
+TOPO_PROPOSAL_TYPE="${TOPO_PROPOSAL_TYPE:-mode_endpoint}"
 LR="${LR:-8e-5}"
 MAMBA_LR="${MAMBA_LR:-3e-5}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 MAMBA_WEIGHT_DECAY="${MAMBA_WEIGHT_DECAY:-0.0}"
 MODE_ENDPOINT_SCALE="${MODE_ENDPOINT_SCALE:-0.20}"
+POLYLINE_CONTROL_SCALE="${POLYLINE_CONTROL_SCALE:-0.12}"
 CORRIDOR_LOSS="${CORRIDOR_LOSS:-0.00}"
 SCORE_LOSS="${SCORE_LOSS:-0.0}"
 MONITOR_INTERVAL_SEC="${MONITOR_INTERVAL_SEC:-120}"
@@ -100,10 +103,11 @@ write_summary() {
   latest_ade="$(json_value "${metrics}" latest_ade)"
   best_ade="$(json_value "${metrics}" best_ade)"
   best_path="$(json_value "${metrics}" best_path)"
-  echo "status,seed,lr,mamba_lr,weight_decay,scale,corridor_loss,score_loss,max_epochs,train_bs,eval_bs,eval_batches,latest_epoch,latest_ade,best_ade,best_path" > "${SUMMARY_CSV}"
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-    "${status}" "${SEED}" "${LR}" "${MAMBA_LR}" "${WEIGHT_DECAY}" "${MODE_ENDPOINT_SCALE}" \
-    "${CORRIDOR_LOSS}" "${SCORE_LOSS}" "${MAX_EPOCHS}" "${TRAIN_BS}" "${EVAL_BS}" "${EVAL_BATCHES}" \
+  echo "status,seed,proposal_type,lr,mamba_lr,weight_decay,scale,polyline_control_scale,corridor_loss,score_loss,max_epochs,train_bs,eval_bs,eval_batches,latest_epoch,latest_ade,best_ade,best_path" > "${SUMMARY_CSV}"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "${status}" "${SEED}" "${TOPO_PROPOSAL_TYPE}" "${LR}" "${MAMBA_LR}" "${WEIGHT_DECAY}" \
+    "${MODE_ENDPOINT_SCALE}" "${POLYLINE_CONTROL_SCALE}" "${CORRIDOR_LOSS}" "${SCORE_LOSS}" \
+    "${MAX_EPOCHS}" "${TRAIN_BS}" "${EVAL_BS}" "${EVAL_BATCHES}" \
     "${latest_epoch:-}" "${latest_ade:-}" "${best_ade:-}" "${best_path:-}" >> "${SUMMARY_CSV}"
 }
 
@@ -132,7 +136,7 @@ log "data=${DATA_ROOT}/${DATA_FILE}"
 log "save_root=${SAVE_ROOT}"
 log "run_log=${RUN_LOG}"
 log "summary_csv=${SUMMARY_CSV}"
-log "config=seed=${SEED} h10/f30 bs=${TRAIN_BS}/${EVAL_BS} eval_batches=${EVAL_BATCHES} lr=${LR} mamba_lr=${MAMBA_LR} scale=${MODE_ENDPOINT_SCALE} corridor_loss=${CORRIDOR_LOSS}"
+log "config=seed=${SEED} h10/f30 proposal=${TOPO_PROPOSAL_TYPE} bs=${TRAIN_BS}/${EVAL_BS} workers=${NUM_WORKERS} pin_memory=${PIN_MEMORY} eval_batches=${EVAL_BATCHES} lr=${LR} mamba_lr=${MAMBA_LR} scale=${MODE_ENDPOINT_SCALE} polyline_control_scale=${POLYLINE_CONTROL_SCALE} corridor_loss=${CORRIDOR_LOSS}"
 
 setsid "${PYTHON_BIN}" train_qcnet.py \
   --dataset interaction_digir \
@@ -145,7 +149,7 @@ setsid "${PYTHON_BIN}" train_qcnet.py \
   --val_batch_size "${EVAL_BS}" \
   --test_batch_size "${EVAL_BS}" \
   --num_workers "${NUM_WORKERS}" \
-  --pin_memory true \
+  --pin_memory "${PIN_MEMORY}" \
   --persistent_workers true \
   --lr "${LR}" \
   --weight_decay "${WEIGHT_DECAY}" \
@@ -169,12 +173,13 @@ setsid "${PYTHON_BIN}" train_qcnet.py \
   --pl2m_radius 80 \
   --a2m_radius 80 \
   --decoder_type topossm \
-  --topo_proposal_type mode_endpoint \
+  --topo_proposal_type "${TOPO_PROPOSAL_TYPE}" \
   --topo_ssm_layers 2 \
   --topo_mamba_d_state 16 \
   --topo_mamba_d_conv 4 \
   --topo_mamba_expand 2 \
   --topo_mode_endpoint_scale "${MODE_ENDPOINT_SCALE}" \
+  --topo_polyline_control_scale "${POLYLINE_CONTROL_SCALE}" \
   --topo_corridor_loss_weight "${CORRIDOR_LOSS}" \
   --topo_score_loss_weight "${SCORE_LOSS}" \
   --topo_score_temperature 0.20 \
