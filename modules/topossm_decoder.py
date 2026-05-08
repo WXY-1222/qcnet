@@ -1130,7 +1130,9 @@ class TopoSSMDecoder(nn.Module):
                                                 agent_state: torch.Tensor,
                                                 mode_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         cv_anchor = self._make_cv_anchors(data, mode_state.device, mode_state.dtype)
+        fallback_goal = self.to_goal(mode_state)
         cv_goal = cv_anchor[:, -1].unsqueeze(1).expand(-1, self.num_modes, -1)
+        cv_goal = cv_goal + self.topo_goal_residual_scale * torch.tanh(fallback_goal)
         agent_tokens = agent_state.unsqueeze(1).expand(-1, self.num_modes, -1)
         interaction_context = self._extract_interaction_context(data, scene_enc).unsqueeze(1).expand(
             -1, self.num_modes, -1)
