@@ -18,6 +18,7 @@ MAX_EPOCHS="${MAX_EPOCHS:-20}"
 TRAIN_BS="${TRAIN_BS:-4}"
 EVAL_BS="${EVAL_BS:-8}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
+EVAL_BATCHES="${EVAL_BATCHES:-0}"
 LR="${LR:-8e-5}"
 MAMBA_LR="${MAMBA_LR:-3e-5}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
@@ -99,10 +100,10 @@ write_summary() {
   latest_ade="$(json_value "${metrics}" latest_ade)"
   best_ade="$(json_value "${metrics}" best_ade)"
   best_path="$(json_value "${metrics}" best_path)"
-  echo "status,seed,lr,mamba_lr,weight_decay,scale,corridor_loss,score_loss,max_epochs,train_bs,eval_bs,latest_epoch,latest_ade,best_ade,best_path" > "${SUMMARY_CSV}"
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  echo "status,seed,lr,mamba_lr,weight_decay,scale,corridor_loss,score_loss,max_epochs,train_bs,eval_bs,eval_batches,latest_epoch,latest_ade,best_ade,best_path" > "${SUMMARY_CSV}"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "${status}" "${SEED}" "${LR}" "${MAMBA_LR}" "${WEIGHT_DECAY}" "${MODE_ENDPOINT_SCALE}" \
-    "${CORRIDOR_LOSS}" "${SCORE_LOSS}" "${MAX_EPOCHS}" "${TRAIN_BS}" "${EVAL_BS}" \
+    "${CORRIDOR_LOSS}" "${SCORE_LOSS}" "${MAX_EPOCHS}" "${TRAIN_BS}" "${EVAL_BS}" "${EVAL_BATCHES}" \
     "${latest_epoch:-}" "${latest_ade:-}" "${best_ade:-}" "${best_path:-}" >> "${SUMMARY_CSV}"
 }
 
@@ -131,7 +132,7 @@ log "data=${DATA_ROOT}/${DATA_FILE}"
 log "save_root=${SAVE_ROOT}"
 log "run_log=${RUN_LOG}"
 log "summary_csv=${SUMMARY_CSV}"
-log "config=seed=${SEED} h10/f30 bs=${TRAIN_BS}/${EVAL_BS} lr=${LR} mamba_lr=${MAMBA_LR} scale=${MODE_ENDPOINT_SCALE} corridor_loss=${CORRIDOR_LOSS}"
+log "config=seed=${SEED} h10/f30 bs=${TRAIN_BS}/${EVAL_BS} eval_batches=${EVAL_BATCHES} lr=${LR} mamba_lr=${MAMBA_LR} scale=${MODE_ENDPOINT_SCALE} corridor_loss=${CORRIDOR_LOSS}"
 
 setsid "${PYTHON_BIN}" train_qcnet.py \
   --dataset interaction_digir \
@@ -150,7 +151,7 @@ setsid "${PYTHON_BIN}" train_qcnet.py \
   --weight_decay "${WEIGHT_DECAY}" \
   --mamba_lr "${MAMBA_LR}" \
   --mamba_weight_decay "${MAMBA_WEIGHT_DECAY}" \
-  --eval_batches 0 \
+  --eval_batches "${EVAL_BATCHES}" \
   --num_modes 6 \
   --eval_k 6 \
   --monitor_metric val_minADE \
