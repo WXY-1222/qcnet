@@ -455,10 +455,11 @@ class TopoSSMDecoder(nn.Module):
                 -1, self.num_modes, self.num_future_steps, self.output_dim)
             anchor_local = anchor_base + anchor_residual
         if proposal_override is not None:
-            anchor_local = proposal_override['loc_propose_pos'][..., :self.output_dim].detach().to(
+            override_anchor = proposal_override['loc_propose_pos'][..., :self.output_dim].detach().to(
                 device=anchor_local.device,
                 dtype=anchor_local.dtype,
             )
+            anchor_local = override_anchor + 0.0 * anchor_local
 
         corridor_feat, corridor_dist, route_jump = self._extract_corridors(data, scene_enc, anchor_local)
         motion = anchor_local.new_zeros(anchor_local.shape)
