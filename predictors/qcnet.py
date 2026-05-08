@@ -1022,7 +1022,7 @@ class QCNet(pl.LightningModule):
                                      'mode_endpoint_polyline_lite', 'corridor_multi_anchor',
                                      'route_slot_polyline', 'soft_route_slot_polyline',
                                      'interaction_decomp_endpoint', 'interaction_cv_endpoint', 'attn_endpoint',
-                                     'topo_query'])
+                                     'topo_query', 'lane_prior_anchor'])
         parser.add_argument('--topo_goal_distance_weight', type=float, default=0.05)
         parser.add_argument('--topo_goal_residual_scale', type=float, default=0.25)
         parser.add_argument('--topo_goal_anchor_blend', type=float, default=1.0)

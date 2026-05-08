@@ -88,13 +88,14 @@ class TopoSSMDecoder(nn.Module):
                 'corridor_query', 'corridor_query_safe', 'decomp_endpoint', 'decomp_endpoint_polyline',
                 'mode_endpoint_anchorbasis', 'mode_endpoint_polyline_readout', 'mode_endpoint_polyline_lite',
                 'corridor_multi_anchor', 'route_slot_polyline', 'soft_route_slot_polyline',
-                'interaction_decomp_endpoint', 'interaction_cv_endpoint', 'attn_endpoint', 'topo_query'):
+                'interaction_decomp_endpoint', 'interaction_cv_endpoint', 'attn_endpoint', 'topo_query',
+                'lane_prior_anchor'):
             raise ValueError(f'{topo_proposal_type} is not a valid topo_proposal_type')
         if topo_proposal_type in (
                 'decomp_endpoint', 'decomp_endpoint_polyline', 'mode_endpoint_anchorbasis',
                 'mode_endpoint_polyline_readout', 'mode_endpoint_polyline_lite', 'corridor_multi_anchor',
                 'route_slot_polyline', 'soft_route_slot_polyline', 'interaction_decomp_endpoint',
-                'interaction_cv_endpoint', 'attn_endpoint', 'topo_query') and output_dim != 2:
+                'interaction_cv_endpoint', 'attn_endpoint', 'topo_query', 'lane_prior_anchor') and output_dim != 2:
             raise ValueError(f'{topo_proposal_type} currently requires output_dim == 2')
 
         self.mode_emb = nn.Embedding(num_modes, hidden_dim)
@@ -181,6 +182,15 @@ class TopoSSMDecoder(nn.Module):
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_dim, self.num_polyline_control_points * 2),
+            )
+        if topo_proposal_type == 'lane_prior_anchor':
+            self.lane_prior_axis_anchor = nn.Parameter(torch.zeros(num_modes, 2))
+            self.to_lane_prior_axis = nn.Sequential(
+                nn.LayerNorm(hidden_dim * 3 + output_dim * 3 + 2),
+                nn.Linear(hidden_dim * 3 + output_dim * 3 + 2, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 2),
             )
         if topo_proposal_type in ('decomp_endpoint', 'decomp_endpoint_polyline'):
             self.endpoint_axis_anchor = nn.Parameter(torch.zeros(num_modes, 2))
@@ -386,6 +396,10 @@ class TopoSSMDecoder(nn.Module):
             nn.init.zeros_(self.to_route_slot_axis[-1].bias)
             nn.init.zeros_(self.to_route_slot_control[-1].weight)
             nn.init.zeros_(self.to_route_slot_control[-1].bias)
+        if topo_proposal_type == 'lane_prior_anchor':
+            self._init_lane_prior_axis_anchor()
+            nn.init.zeros_(self.to_lane_prior_axis[-1].weight)
+            nn.init.zeros_(self.to_lane_prior_axis[-1].bias)
         if topo_proposal_type in ('decomp_endpoint', 'decomp_endpoint_polyline'):
             self._init_decomp_endpoint_polyline_anchor()
             nn.init.zeros_(self.to_endpoint_axis[-1].weight)
@@ -490,6 +504,9 @@ class TopoSSMDecoder(nn.Module):
                 data, scene_enc, agent_state, mode_state)
         elif self.topo_proposal_type == 'soft_route_slot_polyline':
             goal_local, anchor_local = self._make_soft_route_slot_polyline_proposals(
+                data, scene_enc, agent_state, mode_state)
+        elif self.topo_proposal_type == 'lane_prior_anchor':
+            goal_local, anchor_local = self._make_lane_prior_anchor_proposals(
                 data, scene_enc, agent_state, mode_state)
         else:
             goal_local = self.to_goal(mode_state)
@@ -641,6 +658,13 @@ class TopoSSMDecoder(nn.Module):
             self.route_slot_axis_anchor.zero_()
             self.route_slot_axis_anchor[:, 0] = 0.15 * progress
             self.route_slot_axis_anchor[:, 1] = 0.60 * progress
+
+    def _init_lane_prior_axis_anchor(self) -> None:
+        with torch.no_grad():
+            progress = torch.linspace(-1.0, 1.0, self.num_modes, dtype=self.lane_prior_axis_anchor.dtype)
+            self.lane_prior_axis_anchor.zero_()
+            self.lane_prior_axis_anchor[:, 0] = 0.10 * progress
+            self.lane_prior_axis_anchor[:, 1] = 0.50 * progress
 
     def _init_decomp_endpoint_polyline_anchor(self) -> None:
         with torch.no_grad():
@@ -1184,6 +1208,139 @@ class TopoSSMDecoder(nn.Module):
         anchor_residual = self.to_anchor_residual(mode_state).view(
             -1, self.num_modes, self.num_future_steps, self.output_dim)
         anchor_local = anchor_base + anchor_residual
+        return goal_local, anchor_local
+
+    def _make_lane_prior_anchor_proposals(self,
+                                          data: HeteroData,
+                                          scene_enc: Mapping[str, torch.Tensor],
+                                          agent_state: torch.Tensor,
+                                          mode_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = mode_state.device
+        dtype = mode_state.dtype
+        cv_anchor = self._make_cv_anchors(data, device, dtype)
+        cv_goal = cv_anchor[:, -1].unsqueeze(1).expand(-1, self.num_modes, -1)
+
+        map_pos = data['map_polygon']['position'][:, :2].to(device=device, dtype=dtype)
+        if map_pos.numel() == 0:
+            anchor_residual = self.to_anchor_residual(mode_state).view(
+                -1, self.num_modes, self.num_future_steps, self.output_dim)
+            return cv_goal, cv_anchor.unsqueeze(1) + anchor_residual
+
+        map_feat = scene_enc['x_pl'][:, -1].to(device=device, dtype=dtype)
+        agent_origin = data['agent']['position'][:, self.num_historical_steps - 1].to(device=device, dtype=dtype)
+        agent_heading = data['agent']['heading'][:, self.num_historical_steps - 1].to(device=device, dtype=dtype)
+        goal_local = cv_goal.new_empty(cv_goal.shape)
+        anchor_local = cv_goal.new_empty(
+            (mode_state.size(0), self.num_modes, self.num_future_steps, self.output_dim))
+
+        if isinstance(data, Batch):
+            agent_batch = data['agent']['batch'].to(device=device)
+            map_batch = data['map_polygon']['batch'].to(device=device)
+            for batch_id in torch.unique(agent_batch, sorted=True):
+                agent_idx = torch.nonzero(agent_batch == batch_id, as_tuple=False).flatten()
+                map_idx = torch.nonzero(map_batch == batch_id, as_tuple=False).flatten()
+                if agent_idx.numel() == 0:
+                    continue
+                if map_idx.numel() == 0:
+                    anchor_residual = self.to_anchor_residual(mode_state[agent_idx]).view(
+                        -1, self.num_modes, self.num_future_steps, self.output_dim)
+                    goal_local[agent_idx] = cv_goal[agent_idx]
+                    anchor_local[agent_idx] = cv_anchor[agent_idx].unsqueeze(1) + anchor_residual
+                    continue
+                goal_part, anchor_part = self._select_lane_prior_anchor_for_agents(
+                    mode_state[agent_idx],
+                    agent_state[agent_idx],
+                    cv_goal[agent_idx],
+                    cv_anchor[agent_idx],
+                    agent_origin[agent_idx],
+                    agent_heading[agent_idx],
+                    map_pos[map_idx],
+                    map_feat[map_idx],
+                )
+                goal_local[agent_idx] = goal_part
+                anchor_local[agent_idx] = anchor_part
+        else:
+            goal_local, anchor_local = self._select_lane_prior_anchor_for_agents(
+                mode_state,
+                agent_state,
+                cv_goal,
+                cv_anchor,
+                agent_origin,
+                agent_heading,
+                map_pos,
+                map_feat,
+            )
+        return goal_local, anchor_local
+
+    def _select_lane_prior_anchor_for_agents(self,
+                                             mode_state: torch.Tensor,
+                                             agent_state: torch.Tensor,
+                                             cv_goal: torch.Tensor,
+                                             cv_anchor: torch.Tensor,
+                                             agent_origin: torch.Tensor,
+                                             agent_heading: torch.Tensor,
+                                             map_pos: torch.Tensor,
+                                             map_feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_agents = mode_state.size(0)
+        map_local = self._global_to_local(
+            map_pos.unsqueeze(0).expand(num_agents, -1, -1),
+            agent_origin[:, :2],
+            agent_heading,
+        )
+        cv_goal_single = cv_goal[:, 0]
+        forward = map_local[..., 0]
+        lateral = map_local[..., 1].abs()
+        cv_dist = (map_local - cv_goal_single.unsqueeze(1)).norm(dim=-1)
+        target_forward = cv_goal_single[..., 0].clamp_min(5.0).unsqueeze(1)
+        reach_penalty = (forward - target_forward).abs() / self.corridor_dist_norm
+        forward_bonus = forward.clamp(min=0.0, max=self.corridor_dist_norm) / self.corridor_dist_norm
+        geometry_score = (
+            -0.70 * reach_penalty
+            -0.25 * lateral / self.corridor_dist_norm
+            -0.25 * cv_dist / self.corridor_dist_norm
+            +0.15 * forward_bonus
+        )
+        geometry_score = geometry_score.masked_fill(forward < 0.5, -1e4)
+
+        query_score = torch.einsum('nkh,mh->nkm', mode_state, map_feat) / math.sqrt(self.hidden_dim)
+        score = geometry_score.unsqueeze(1) + 0.10 * query_score
+        topk = min(max(self.num_modes * 4, int(self.topo_route_slot_topk)), map_pos.size(0))
+        top_score, top_idx = score.topk(k=topk, dim=-1, largest=True)
+
+        # Spread modes across the strongest reachable lane candidates instead of letting all modes collapse.
+        mode_rank = torch.linspace(
+            0,
+            topk - 1,
+            self.num_modes,
+            device=mode_state.device,
+        ).round().long().view(1, self.num_modes, 1)
+        sorted_rank = top_score.argsort(dim=-1, descending=True)
+        picked_rank = sorted_rank.gather(
+            dim=-1,
+            index=mode_rank.expand(num_agents, -1, -1),
+        )
+        slot_idx = top_idx.gather(dim=-1, index=picked_rank).squeeze(-1)
+        slot_local = map_local.gather(
+            dim=1,
+            index=slot_idx.reshape(num_agents, self.num_modes, 1).expand(-1, -1, self.output_dim),
+        )
+        slot_feat = map_feat[slot_idx]
+
+        agent_tokens = agent_state.unsqueeze(1).expand(-1, self.num_modes, -1)
+        axis_anchor = self.lane_prior_axis_anchor.unsqueeze(0).expand(num_agents, -1, -1)
+        axis_input = torch.cat([mode_state, agent_tokens, slot_feat, slot_local, cv_goal, axis_anchor], dim=-1)
+        axis_coeff = torch.tanh(axis_anchor + self.to_lane_prior_axis(axis_input))
+        slot_dir, slot_ortho = self._build_goal_basis(slot_local)
+        axis_delta = (
+            self.topo_route_slot_longitudinal_scale * axis_coeff[..., :1] * slot_dir
+            + self.topo_route_slot_lateral_scale * axis_coeff[..., 1:2] * slot_ortho
+        )
+        goal_local = slot_local + axis_delta
+
+        anchor_base = cv_anchor.unsqueeze(1) + self._make_goal_anchors(goal_local - cv_goal)
+        anchor_residual = self.to_anchor_residual(mode_state).view(
+            -1, self.num_modes, self.num_future_steps, self.output_dim)
+        anchor_local = anchor_base + 0.25 * anchor_residual
         return goal_local, anchor_local
 
     def _make_decomp_endpoint_goals(self,
