@@ -1217,6 +1217,7 @@ class TopoSSMDecoder(nn.Module):
                                           mode_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         device = mode_state.device
         dtype = mode_state.dtype
+        fallback_goal = self.to_goal(mode_state)
         cv_anchor = self._make_cv_anchors(data, device, dtype)
         cv_goal = cv_anchor[:, -1].unsqueeze(1).expand(-1, self.num_modes, -1)
 
@@ -1270,6 +1271,7 @@ class TopoSSMDecoder(nn.Module):
                 map_pos,
                 map_feat,
             )
+        goal_local = goal_local + 0.0 * fallback_goal
         return goal_local, anchor_local
 
     def _select_lane_prior_anchor_for_agents(self,
