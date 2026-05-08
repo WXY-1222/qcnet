@@ -88,13 +88,13 @@ class TopoSSMDecoder(nn.Module):
                 'corridor_query', 'corridor_query_safe', 'decomp_endpoint', 'decomp_endpoint_polyline',
                 'mode_endpoint_anchorbasis', 'mode_endpoint_polyline_readout', 'mode_endpoint_polyline_lite',
                 'corridor_multi_anchor', 'route_slot_polyline', 'soft_route_slot_polyline',
-                'interaction_decomp_endpoint', 'interaction_cv_endpoint'):
+                'interaction_decomp_endpoint', 'interaction_cv_endpoint', 'attn_endpoint'):
             raise ValueError(f'{topo_proposal_type} is not a valid topo_proposal_type')
         if topo_proposal_type in (
                 'decomp_endpoint', 'decomp_endpoint_polyline', 'mode_endpoint_anchorbasis',
                 'mode_endpoint_polyline_readout', 'mode_endpoint_polyline_lite', 'corridor_multi_anchor',
                 'route_slot_polyline', 'soft_route_slot_polyline', 'interaction_decomp_endpoint',
-                'interaction_cv_endpoint') and output_dim != 2:
+                'interaction_cv_endpoint', 'attn_endpoint') and output_dim != 2:
             raise ValueError(f'{topo_proposal_type} currently requires output_dim == 2')
 
         self.mode_emb = nn.Embedding(num_modes, hidden_dim)
@@ -206,6 +206,31 @@ class TopoSSMDecoder(nn.Module):
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_dim, 2),
+            )
+        if topo_proposal_type == 'attn_endpoint':
+            self.attn_endpoint_anchor = nn.Parameter(torch.zeros(num_modes, output_dim))
+            self.attn_token_geo_proj = nn.Sequential(
+                nn.LayerNorm(3),
+                nn.Linear(3, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.attn_q = nn.Linear(hidden_dim, hidden_dim)
+            self.attn_k = nn.Linear(hidden_dim, hidden_dim)
+            self.attn_v = nn.Linear(hidden_dim, hidden_dim)
+            self.attn_out = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            self.to_attn_endpoint_delta = nn.Sequential(
+                nn.LayerNorm(hidden_dim * 3 + output_dim * 2),
+                nn.Linear(hidden_dim * 3 + output_dim * 2, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
             )
         if topo_proposal_type == 'decomp_endpoint_polyline':
             self.num_polyline_control_points = 2
@@ -333,6 +358,10 @@ class TopoSSMDecoder(nn.Module):
             self._init_interaction_axis_anchor()
             nn.init.zeros_(self.to_interaction_axis[-1].weight)
             nn.init.zeros_(self.to_interaction_axis[-1].bias)
+        if topo_proposal_type == 'attn_endpoint':
+            self._init_attn_endpoint_anchor()
+            nn.init.zeros_(self.to_attn_endpoint_delta[-1].weight)
+            nn.init.zeros_(self.to_attn_endpoint_delta[-1].bias)
         if topo_proposal_type == 'decomp_endpoint_polyline':
             nn.init.zeros_(self.to_polyline_control[-1].weight)
             nn.init.zeros_(self.to_polyline_control[-1].bias)
@@ -387,6 +416,9 @@ class TopoSSMDecoder(nn.Module):
             anchor_local = anchor_base + anchor_residual
         elif self.topo_proposal_type == 'interaction_cv_endpoint':
             goal_local, anchor_local = self._make_interaction_cv_endpoint_proposals(
+                data, scene_enc, agent_state, mode_state)
+        elif self.topo_proposal_type == 'attn_endpoint':
+            goal_local, anchor_local = self._make_attn_endpoint_proposals(
                 data, scene_enc, agent_state, mode_state)
         elif self.topo_proposal_type == 'decomp_endpoint_polyline':
             goal_local, anchor_local = self._make_decomp_endpoint_polyline_proposals(agent_state, mode_state)
@@ -583,6 +615,13 @@ class TopoSSMDecoder(nn.Module):
             self.interaction_axis_anchor.zero_()
             self.interaction_axis_anchor[:, 0] = 0.20 * progress
             self.interaction_axis_anchor[:, 1] = 0.80 * progress
+
+    def _init_attn_endpoint_anchor(self) -> None:
+        with torch.no_grad():
+            progress = torch.linspace(-1.0, 1.0, self.num_modes, dtype=self.attn_endpoint_anchor.dtype)
+            self.attn_endpoint_anchor.zero_()
+            self.attn_endpoint_anchor[:, 0] = 0.30 * progress
+            self.attn_endpoint_anchor[:, 1] = progress
 
     def _make_mode_endpoint_goals(self,
                                   agent_state: torch.Tensor,
@@ -1149,6 +1188,99 @@ class TopoSSMDecoder(nn.Module):
             -1, self.num_modes, self.num_future_steps, self.output_dim)
         anchor_local = anchor_base + 0.25 * anchor_residual
         return goal_local, anchor_local
+
+    def _make_attn_endpoint_proposals(self,
+                                      data: HeteroData,
+                                      scene_enc: Mapping[str, torch.Tensor],
+                                      agent_state: torch.Tensor,
+                                      mode_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        fallback_goal = self.to_goal(mode_state)
+        attn_context = self._attend_scene_tokens(data, scene_enc, mode_state)
+        agent_tokens = agent_state.unsqueeze(1).expand(-1, self.num_modes, -1)
+        endpoint_anchor = self.attn_endpoint_anchor.unsqueeze(0).expand(mode_state.size(0), -1, -1)
+        delta_input = torch.cat([mode_state, agent_tokens, attn_context, fallback_goal, endpoint_anchor], dim=-1)
+        endpoint_delta = endpoint_anchor + self.to_attn_endpoint_delta(delta_input)
+        endpoint_delta = self.topo_mode_endpoint_scale * torch.tanh(endpoint_delta)
+        goal_local = fallback_goal + endpoint_delta
+        anchor_base = self._make_goal_anchors(goal_local)
+        anchor_residual = self.to_anchor_residual(mode_state).view(
+            -1, self.num_modes, self.num_future_steps, self.output_dim)
+        anchor_local = anchor_base + anchor_residual
+        return goal_local, anchor_local
+
+    def _attend_scene_tokens(self,
+                             data: HeteroData,
+                             scene_enc: Mapping[str, torch.Tensor],
+                             mode_state: torch.Tensor) -> torch.Tensor:
+        device = mode_state.device
+        dtype = mode_state.dtype
+        agent_feat = scene_enc['x_a'][:, -1].to(device=device, dtype=dtype)
+        agent_pos = data['agent']['position'][:, self.num_historical_steps - 1, :2].to(
+            device=device, dtype=dtype)
+        agent_heading = data['agent']['heading'][:, self.num_historical_steps - 1].to(device=device, dtype=dtype)
+
+        map_pos = data['map_polygon']['position'][:, :2].to(device=device, dtype=dtype)
+        raw_map_feat = scene_enc.get('x_pl', None)
+        if raw_map_feat is not None and map_pos.numel() > 0:
+            map_feat = raw_map_feat[:, -1] if raw_map_feat.dim() == 3 else raw_map_feat
+            map_feat = map_feat.to(device=device, dtype=dtype)
+        else:
+            map_feat = agent_feat.new_zeros((0, self.hidden_dim))
+            map_pos = agent_pos.new_zeros((0, self.output_dim))
+
+        context = mode_state.new_empty(mode_state.shape)
+        if isinstance(data, Batch):
+            agent_batch = data['agent']['batch'].to(device=device)
+            map_batch = data['map_polygon']['batch'].to(device=device) if map_pos.numel() > 0 else None
+            for batch_id in torch.unique(agent_batch, sorted=True):
+                agent_idx = torch.nonzero(agent_batch == batch_id, as_tuple=False).flatten()
+                if agent_idx.numel() == 0:
+                    continue
+                if map_batch is not None:
+                    map_idx = torch.nonzero(map_batch == batch_id, as_tuple=False).flatten()
+                    token_pos = torch.cat([agent_pos[agent_idx], map_pos[map_idx]], dim=0)
+                    token_feat = torch.cat([agent_feat[agent_idx], map_feat[map_idx]], dim=0)
+                else:
+                    token_pos = agent_pos[agent_idx]
+                    token_feat = agent_feat[agent_idx]
+                context[agent_idx] = self._attend_tokens_for_agents(
+                    mode_state[agent_idx],
+                    agent_pos[agent_idx],
+                    agent_heading[agent_idx],
+                    token_pos,
+                    token_feat,
+                )
+        else:
+            token_pos = torch.cat([agent_pos, map_pos], dim=0) if map_pos.numel() > 0 else agent_pos
+            token_feat = torch.cat([agent_feat, map_feat], dim=0) if map_feat.numel() > 0 else agent_feat
+            context = self._attend_tokens_for_agents(mode_state, agent_pos, agent_heading, token_pos, token_feat)
+        return context
+
+    def _attend_tokens_for_agents(self,
+                                  mode_state: torch.Tensor,
+                                  agent_pos: torch.Tensor,
+                                  agent_heading: torch.Tensor,
+                                  token_pos: torch.Tensor,
+                                  token_feat: torch.Tensor) -> torch.Tensor:
+        rel = token_pos.unsqueeze(0) - agent_pos.unsqueeze(1)
+        cos = agent_heading.cos().view(-1, 1)
+        sin = agent_heading.sin().view(-1, 1)
+        local_x = rel[..., 0] * cos + rel[..., 1] * sin
+        local_y = -rel[..., 0] * sin + rel[..., 1] * cos
+        local_dist = rel.norm(dim=-1) / self.corridor_dist_norm
+        token_geo = torch.stack([
+            local_x / self.corridor_dist_norm,
+            local_y / self.corridor_dist_norm,
+            local_dist,
+        ], dim=-1)
+        token_state = token_feat.unsqueeze(0) + self.attn_token_geo_proj(token_geo)
+        query = self.attn_q(mode_state)
+        key = self.attn_k(token_state)
+        value = self.attn_v(token_state)
+        score = torch.einsum('nkh,nsh->nks', query, key) / math.sqrt(self.hidden_dim)
+        weight = torch.softmax(score, dim=-1)
+        attended = torch.einsum('nks,nsh->nkh', weight, value)
+        return self.attn_out(attended)
 
     def _make_cv_anchors(self,
                          data: HeteroData,
